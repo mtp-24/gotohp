@@ -18,18 +18,18 @@ const elapsedSeconds = ref(0)
 // Wall clock, refreshed by the ticker for countdowns.
 const now = ref(Date.now())
 let elapsedInterval: ReturnType<typeof setInterval> | null = null
-// Speed smoothed over roughly the last ten seconds, so the ETA does not jump
-// with every progress sample.
-const smoothedSpeed = ref(0)
+// Samples of finished work over the last few minutes, for the ETA.
+const workSamples: { t: number; work: number }[] = []
+const etaWindowMs = 2 * 60 * 1000
+const etaMinSampleMs = 20 * 1000
+let sampledRunId = -1
 
 onMounted(() => {
   elapsedInterval = setInterval(() => {
     now.value = Date.now()
     if (state.startTime > 0 && state.isUploading) {
       elapsedSeconds.value = Math.floor((Date.now() - state.startTime) / 1000)
-      smoothedSpeed.value = smoothedSpeed.value === 0
-        ? state.uploadSpeed
-        : smoothedSpeed.value * 0.8 + state.uploadSpeed * 0.2
+      sampleWork()
     }
   }, 1000)
 })
@@ -60,15 +60,23 @@ const stats = computed(() => {
   let runTotal = 0
   let runFinished = 0
   let uploadableSkips = 0
+  // Work in this run, measured in bytes plus a fixed cost per file.
+  let runWork = 0
+  let runWorkFinished = 0
   for (const item of state.items) {
     counts[item.State]++
     if (item.State === 'skipped' && item.SkipCode) uploadableSkips++
     if (item.runId === state.runId) {
       runTotal++
-      if (item.State !== 'queued' && item.State !== 'active') runFinished++
+      const work = itemWork(item)
+      runWork += work
+      if (item.State !== 'queued' && item.State !== 'active') {
+        runFinished++
+        runWorkFinished += work
+      }
     }
   }
-  return { counts, runTotal, runFinished, uploadableSkips }
+  return { counts, runTotal, runFinished, uploadableSkips, runWork, runWorkFinished }
 })
 const counts = computed(() => stats.value.counts)
 const runTotal = computed(() => stats.value.runTotal)
@@ -135,20 +143,62 @@ function formatDuration(totalSeconds: number): string {
 
 const elapsedDisplay = computed(() => formatDuration(elapsedSeconds.value))
 
-// Time left for the queued and active items: remaining bytes over the smoothed
-// speed, or, before any bytes move, the average time per finished item.
+// The ETA projects how fast the queue has really been finishing work over
+// the last two minutes onto the work left. Work counts every file's bytes
+// plus a fixed cost per file, whatever happens to it: a file already in the
+// library is hashed and skipped quickly without sending its bytes, so an
+// estimate from upload speed alone wildly overstates the time left.
+const perFileWork = 2 * 1024 * 1024
+function itemWork(item: QueueItem): number {
+  return Math.max(0, item.Size) + perFileWork
+}
+
+const etaHeld = computed(() => state.queueStatus.Paused || state.queueStatus.WaitingForNetwork || state.queueStatus.RateLimitedUntil > 0)
+const etaSeconds = ref<number | null>(null)
+
+function sampleWork() {
+  const nowMs = Date.now()
+  if (sampledRunId !== state.runId || etaHeld.value) {
+    // A new run, or a pause that would read as slowness: start measuring again.
+    sampledRunId = state.runId
+    workSamples.length = 0
+    etaSeconds.value = null
+    if (etaHeld.value) return
+  }
+  // Bytes already sent by files still uploading count as finished work.
+  const inFlight = busyThreads.value.reduce((sum, thread) => sum + (thread.Status === 'uploading' ? thread.BytesUploaded : 0), 0)
+  const work = stats.value.runWorkFinished + inFlight
+  workSamples.push({ t: nowMs, work })
+  while (workSamples.length > 2 && nowMs - workSamples[0].t > etaWindowMs) workSamples.shift()
+
+  const first = workSamples[0]
+  const spanMs = nowMs - first.t
+  const done = work - first.work
+  const remaining = stats.value.runWork - work
+  if (spanMs < etaMinSampleMs || done <= 0 || remaining <= 0) {
+    if (remaining <= 0) etaSeconds.value = null
+    return
+  }
+  etaSeconds.value = remaining / (done / (spanMs / 1000))
+}
+
+// Rounded so the estimate reads as one, and does not flicker by the second.
+function formatEta(seconds: number): string {
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 1) return 'under a minute'
+  if (minutes < 60) return `about ${minutes} min`
+  const roundedMinutes = Math.round(seconds / 300) * 5
+  const hours = Math.floor(roundedMinutes / 60)
+  const rest = roundedMinutes % 60
+  if (hours < 24) return rest ? `about ${hours} h ${rest} min` : `about ${hours} h`
+  const days = Math.floor(hours / 24)
+  return `about ${days} d ${hours % 24} h`
+}
+
 const etaDisplay = computed(() => {
-  if (!state.isUploading || state.queueStatus.Paused || state.queueStatus.WaitingForNetwork || state.queueStatus.RateLimitedUntil > 0) return '--'
-  const remainingItems = runTotal.value - runFinished.value
-  if (remainingItems <= 0) return '--'
-  const remainingBytes = state.totalBytes - state.uploadedBytes
-  if (remainingBytes > 0 && smoothedSpeed.value > 0) {
-    return formatDuration(remainingBytes / smoothedSpeed.value)
-  }
-  if (runFinished.value > 0 && elapsedSeconds.value > 0) {
-    return formatDuration((elapsedSeconds.value / runFinished.value) * remainingItems)
-  }
-  return '--'
+  if (!state.isUploading || etaHeld.value || runFinished.value >= runTotal.value) return '--'
+  if (etaSeconds.value === null) return 'estimating…'
+  return `${formatEta(etaSeconds.value)} left`
 })
 
 const bytesDisplay = computed(() => {
@@ -289,7 +339,6 @@ async function copyResults() {
       >
         <Hourglass :size="12" />
         <span class="tabular-nums text-foreground">{{ etaDisplay }}</span>
-        <span>left</span>
       </div>
     </div>
 
