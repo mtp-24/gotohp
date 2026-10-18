@@ -10,6 +10,7 @@ import (
 
 type livePhotoUploadAPI interface {
 	FindRemoteMediaByHash(hash []byte) (string, error)
+	FindLivePhotoMotionByHash(hash []byte) (string, error)
 	GetUploadToken(sha1Hash string, fileSize int64) (string, error)
 	UploadFileWithProgress(ctx context.Context, filePath string, uploadToken string, onProgress UploadProgressCallback) (ScottyFinalizeToken, error)
 	CommitLivePhoto(input LivePhotoCreateRequest) (string, error)
@@ -75,6 +76,24 @@ func uploadLivePhotoWithCallback(
 	}
 	if photoRemoteKey != "" {
 		if options.UpdateExistingPhotosToLive {
+			// A plain hash match on the video cannot tell an attached motion
+			// from a standalone clip; the motion lookup can, and skips photos
+			// that are already Live instead of re-uploading their video.
+			motionKey, err := api.FindLivePhotoMotionByHash(videoSHA1)
+			if err != nil {
+				return "", false, fmt.Errorf("check Live Photo motion: %w", err)
+			}
+			if motionKey != "" {
+				reporter.TotalBytesDelta(-totalBytes)
+				reporter.ThreadStatus(ThreadStatus{
+					WorkerID: workerID,
+					Status:   "skipped",
+					FilePath: pair.PhotoPath,
+					FileName: displayName,
+					Message:  "Skipped: already a Live Photo in your library",
+				})
+				return motionKey, true, nil
+			}
 			reporter.TotalBytesDelta(-photoInfo.Size())
 			mediaKey, err := reconcileExistingLivePhoto(
 				ctx,

@@ -15,6 +15,7 @@ import (
 
 	"app/generated"
 
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -331,11 +332,12 @@ func (a *Api) GetUploadToken(shaHashB64 string, fileSize int64) (string, error) 
 	return uploadToken, nil
 }
 
-// Check library for existing files with the hash
-func (a *Api) FindRemoteMediaByHash(shaHash []byte) (string, error) {
-	// Create the protobuf message
+// hashCheckEndpoint looks up library items by SHA-1.
+const hashCheckEndpoint = "https://photosdata-pa.googleapis.com/6439526531001121323/5084965799730810217"
 
-	// Create and initialize the protobuf message with all required nested structures
+// FindRemoteMediaByHash returns the media key of a library item with this
+// SHA-1, or "" when there is none.
+func (a *Api) FindRemoteMediaByHash(shaHash []byte) (string, error) {
 	protoBody := generated.HashCheck{
 		Field1: &generated.HashCheckField1Type{
 			Field1: &generated.HashCheckField1TypeField1Type{
@@ -344,14 +346,40 @@ func (a *Api) FindRemoteMediaByHash(shaHash []byte) (string, error) {
 			Field2: &generated.HashCheckField1TypeField2Type{},
 		},
 	}
-
-	// Serialize the protobuf message
 	serializedData, err := proto.Marshal(&protoBody)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal protobuf: %w", err)
 	}
+	return a.findRemoteMedia(serializedData)
+}
 
-	// Prepare headers
+// FindLivePhotoMotionByHash looks up a video SHA-1 the way the Google Photos
+// app checks Live Photo motion: field 5 = 2 marks the query as a Live Photo
+// movie, so it only matches once that video is attached to a still. The
+// generated HashCheck message has no field 5, so the request is built by hand:
+// {1: {1: {1: sha1, 5: 2}, 2: {}}}.
+func (a *Api) FindLivePhotoMotionByHash(shaHash []byte) (string, error) {
+	var query []byte
+	query = protowire.AppendTag(query, 1, protowire.BytesType)
+	query = protowire.AppendBytes(query, shaHash)
+	query = protowire.AppendTag(query, 5, protowire.VarintType)
+	query = protowire.AppendVarint(query, 2)
+
+	var lookup []byte
+	lookup = protowire.AppendTag(lookup, 1, protowire.BytesType)
+	lookup = protowire.AppendBytes(lookup, query)
+	lookup = protowire.AppendTag(lookup, 2, protowire.BytesType)
+	lookup = protowire.AppendBytes(lookup, nil)
+
+	var body []byte
+	body = protowire.AppendTag(body, 1, protowire.BytesType)
+	body = protowire.AppendBytes(body, lookup)
+	return a.findRemoteMedia(body)
+}
+
+func (a *Api) findRemoteMedia(serializedData []byte) (string, error) {
+	// The x-goog-ext headers the commit RPCs send must not be added here; the
+	// lookup rejects them with HTTP 400.
 	headers := map[string]string{
 		"Accept-Encoding": "gzip",
 		"Accept-Language": a.language,
@@ -360,19 +388,17 @@ func (a *Api) FindRemoteMediaByHash(shaHash []byte) (string, error) {
 	}
 
 	resp, err := a.send(func() (*http.Request, error) {
-		return newPostRequest("https://photosdata-pa.googleapis.com/6439526531001121323/5084965799730810217", serializedData, headers)
+		return newPostRequest(hashCheckEndpoint, serializedData, headers)
 	})
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", newAPIError(resp)
 	}
 
-	// Parse the response body
 	bodyBytes, err := ReadResponseBody(resp)
 	if err != nil {
 		return "", fmt.Errorf("failed to read response body: %w", err)
@@ -382,10 +408,7 @@ func (a *Api) FindRemoteMediaByHash(shaHash []byte) (string, error) {
 	if err := proto.Unmarshal(bodyBytes, &pbResp); err != nil {
 		return "", fmt.Errorf("failed to unmarshal protobuf: %w", err)
 	}
-
-	mediaKey := pbResp.GetMediaKey()
-
-	return mediaKey, nil
+	return pbResp.GetMediaKey(), nil
 }
 
 // UploadProgressCallback is called with progress updates during file upload
