@@ -1,10 +1,12 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -414,6 +416,29 @@ func isSupportedByGooglePhotos(filename string) bool {
 	return supportedFormats[ext[1:]]
 }
 
+// appleDoubleMagic is the header of the "._name" sidecar files macOS writes
+// next to each file on volumes without native xattr support (exFAT, FAT32, SMB).
+var appleDoubleMagic = []byte{0x00, 0x05, 0x16, 0x07}
+
+// isAppleDoubleFile reports whether path is a macOS AppleDouble metadata file.
+// These share the original's extension (e.g. "._IMG_0001.JPG") but hold no
+// media data, so Google Photos rejects them.
+func isAppleDoubleFile(path string) bool {
+	if !strings.HasPrefix(filepath.Base(path), "._") {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	header := make([]byte, len(appleDoubleMagic))
+	if _, err := io.ReadFull(f, header); err != nil {
+		return false
+	}
+	return bytes.Equal(header, appleDoubleMagic)
+}
+
 func scanDirectoryForFiles(path string, recursive bool, excludePattern string, cancelled func() bool) ([]string, error) {
 	var files []string
 
@@ -467,6 +492,9 @@ func filterGooglePhotosFilesWithCancel(paths []string, opts UploadOptions, cance
 	seenFiles := make(map[string][]seenUploadFile)
 	appendFile := func(path string, info os.FileInfo) {
 		if !opts.DisableUnsupportedFilesFilter && !isSupportedByGooglePhotos(path) {
+			return
+		}
+		if isAppleDoubleFile(path) {
 			return
 		}
 		canonicalPath := canonicalUploadPath(path)
