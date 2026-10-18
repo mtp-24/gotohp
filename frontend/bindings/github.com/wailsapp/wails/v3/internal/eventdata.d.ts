@@ -19,8 +19,8 @@ declare module "@wailsio/runtime" {
             "albumProgress": core$0.AlbumStatus;
             "files-drag": boolean;
             "files-dropped": core$0.FilesDroppedEvent;
-            "queueItemUpdate": core$0.QueueItem;
             "queueItems": core$0.QueueItem[];
+            "queueItemsUpdated": core$0.QueueItem[];
             "queueStatus": core$0.QueueStatus;
             "startUpload": core$0.StartUploadEvent;
             "uploadCancel": void;

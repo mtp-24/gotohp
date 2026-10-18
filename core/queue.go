@@ -81,9 +81,11 @@ const scanReportInterval = 200 * time.Millisecond
 type QueueReporter interface {
 	// QueueItems announces newly added items in queue order.
 	QueueItems([]QueueItem)
-	// QueueItemUpdate carries the full item whenever its state changes. It can
+	// QueueItemsUpdated carries the full items whose state changed, in one
+	// call for changes made together, such as cancelling a large queue. An
+	// update can
 	// arrive before QueueItems for the same item.
-	QueueItemUpdate(QueueItem)
+	QueueItemsUpdated([]QueueItem)
 	QueueStatus(QueueStatus)
 }
 
@@ -1112,8 +1114,8 @@ func (m *UploadManager) reportUpdates(items []QueueItem) {
 	if m.queue == nil {
 		return
 	}
-	for _, item := range items {
-		m.queue.QueueItemUpdate(item)
+	if len(items) > 0 {
+		m.queue.QueueItemsUpdated(items)
 	}
 }
 

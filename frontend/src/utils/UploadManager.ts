@@ -1,5 +1,5 @@
 import { Clipboard, Events } from "@wailsio/runtime";
-import { reactive } from "vue";
+import { markRaw, reactive, toRaw } from "vue";
 import {
   recordUploadResult,
   type UploadResults,
@@ -209,16 +209,33 @@ class UploadManager {
       }
     });
 
-    Events.On("queueItemUpdate", (event: { data: QueueItem }) => {
-      const index = this.itemIndex.get(event.data.ID);
-      if (index === undefined) {
-        this.insertItem(event.data);
-        return;
+    // Changes made together (e.g. cancelling thousands of queued items)
+    // arrive as one event and are applied in one pass, so the list renders
+    // once instead of once per item.
+    Events.On("queueItemsUpdated", (event: { data: QueueItem[] }) => {
+      // For big batches, edit a plain copy and swap it in once: setting
+      // thousands of entries on the reactive array one by one is far slower.
+      // Small batches, the common case, are cheaper to apply in place.
+      const bulk = event.data.length > 100;
+      const items = bulk ? toRaw(this.state.items).slice() : this.state.items;
+      const added: QueueItem[] = [];
+      for (const update of event.data) {
+        const index = this.itemIndex.get(update.ID);
+        if (index === undefined) {
+          added.push(update);
+          continue;
+        }
+        const runId = update.State === "queued" || update.State === "active"
+          ? this.state.runId
+          : items[index].runId;
+        items[index] = markRaw({ ...update, runId });
       }
-      const runId = event.data.State === "queued" || event.data.State === "active"
-        ? this.state.runId
-        : this.state.items[index].runId;
-      this.state.items[index] = { ...event.data, runId };
+      if (bulk) {
+        this.state.items = items;
+      }
+      for (const item of added) {
+        this.insertItem(item);
+      }
     });
 
     Events.On("queueStatus", (event: { data: QueueStatus }) => {
@@ -353,7 +370,9 @@ class UploadManager {
 
   private insertItem(item: QueueItem) {
     this.itemIndex.set(item.ID, this.state.items.length);
-    this.state.items.push({ ...item, runId: this.state.runId });
+    // Items are replaced, never mutated, so deep reactivity on thousands of
+    // them would only cost memory and time.
+    this.state.items.push(markRaw({ ...item, runId: this.state.runId }));
   }
 
   public cancelUpload() {

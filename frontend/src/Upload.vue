@@ -43,15 +43,35 @@ const threadsList = computed(() => {
     .sort((a, b) => a.WorkerID - b.WorkerID)
 })
 
-const runItems = computed(() => state.items.filter(item => item.runId === state.runId))
-const runFinished = computed(() => runItems.value.filter(item => item.State !== 'queued' && item.State !== 'active').length)
+type Filter = 'all' | QueueItemState
+
+// Every list statistic in one pass: with tens of thousands of items, a pass
+// per statistic made each update noticeably slow.
+const stats = computed(() => {
+  const counts: Record<Filter, number> = { all: state.items.length, queued: 0, active: 0, done: 0, failed: 0, skipped: 0, cancelled: 0 }
+  let runTotal = 0
+  let runFinished = 0
+  let uploadableSkips = 0
+  for (const item of state.items) {
+    counts[item.State]++
+    if (item.State === 'skipped' && item.SkipCode) uploadableSkips++
+    if (item.runId === state.runId) {
+      runTotal++
+      if (item.State !== 'queued' && item.State !== 'active') runFinished++
+    }
+  }
+  return { counts, runTotal, runFinished, uploadableSkips }
+})
+const counts = computed(() => stats.value.counts)
+const runTotal = computed(() => stats.value.runTotal)
+const runFinished = computed(() => stats.value.runFinished)
+const uploadableSkips = computed(() => stats.value.uploadableSkips)
 
 const progressPercent = computed(() => {
-  if (runItems.value.length === 0) return 0
-  return Math.round((runFinished.value / runItems.value.length) * 100)
+  if (runTotal.value === 0) return 0
+  return Math.round((runFinished.value / runTotal.value) * 100)
 })
 
-type Filter = 'all' | QueueItemState
 const filter = ref<Filter>('all')
 const filters: { value: Filter; label: string }[] = [
   { value: 'all', label: 'All' },
@@ -63,13 +83,6 @@ const filters: { value: Filter; label: string }[] = [
   { value: 'cancelled', label: 'Cancelled' },
 ]
 
-const counts = computed(() => {
-  const result: Record<Filter, number> = { all: state.items.length, queued: 0, active: 0, done: 0, failed: 0, skipped: 0, cancelled: 0 }
-  for (const item of state.items) {
-    result[item.State]++
-  }
-  return result
-})
 
 // Rendering thousands of rows at once stalls the webview; grow the list on demand.
 const pageSize = 200
@@ -118,7 +131,7 @@ const elapsedDisplay = computed(() => formatDuration(elapsedSeconds.value))
 // speed, or, before any bytes move, the average time per finished item.
 const etaDisplay = computed(() => {
   if (!state.isUploading || state.queueStatus.Paused || state.queueStatus.WaitingForNetwork || state.queueStatus.RateLimitedUntil > 0) return '--'
-  const remainingItems = runItems.value.length - runFinished.value
+  const remainingItems = runTotal.value - runFinished.value
   if (remainingItems <= 0) return '--'
   const remainingBytes = state.totalBytes - state.uploadedBytes
   if (remainingBytes > 0 && smoothedSpeed.value > 0) {
@@ -141,7 +154,6 @@ const albumProgressPercent = computed(() => {
 })
 
 const hasPendingUploads = computed(() => counts.value.queued > 0 || counts.value.active > 0)
-const uploadableSkips = computed(() => state.items.filter(item => item.State === 'skipped' && item.SkipCode).length)
 
 const scanLabel = computed(() => {
   const scan = state.queueStatus.Scan
@@ -208,7 +220,7 @@ async function copyResults() {
     <!-- Header -->
     <div class="text-center">
       <p class="text-2xl font-bold tabular-nums">
-        {{ runFinished }}<span class="text-muted-foreground font-normal">/</span><span class="text-muted-foreground">{{ runItems.length }}</span>
+        {{ runFinished }}<span class="text-muted-foreground font-normal">/</span><span class="text-muted-foreground">{{ runTotal }}</span>
       </p>
       <p class="text-xs text-muted-foreground flex items-center justify-center gap-1.5">
         <WifiOff

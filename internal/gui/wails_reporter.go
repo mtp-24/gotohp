@@ -27,13 +27,13 @@ func (w *WailsReporter) AlbumProgress(s core.AlbumStatus)    { w.app.Event.Emit(
 func (w *WailsReporter) AlbumComplete(s core.AlbumStatus)    { w.app.Event.Emit("albumComplete", s) }
 func (w *WailsReporter) AlbumError(e core.AlbumError)        { w.app.Event.Emit("albumError", e) }
 
-// QueueItems, QueueItemUpdate and QueueStatus implement core.QueueReporter.
+// QueueItems, QueueItemsUpdated and QueueStatus implement core.QueueReporter.
 func (w *WailsReporter) QueueItems(items []core.QueueItem) {
 	w.app.Event.Emit("queueItems", items)
 }
 
-func (w *WailsReporter) QueueItemUpdate(item core.QueueItem) {
-	w.app.Event.Emit("queueItemUpdate", item)
+func (w *WailsReporter) QueueItemsUpdated(items []core.QueueItem) {
+	w.app.Event.Emit("queueItemsUpdated", items)
 }
 
 func (w *WailsReporter) QueueStatus(status core.QueueStatus) {

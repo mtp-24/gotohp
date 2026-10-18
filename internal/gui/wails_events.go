@@ -23,7 +23,7 @@ func init() {
 	application.RegisterEvent[bool]("files-drag")
 	application.RegisterEvent[core.StartUploadEvent]("startUpload")
 	application.RegisterEvent[[]core.QueueItem]("queueItems")
-	application.RegisterEvent[core.QueueItem]("queueItemUpdate")
+	application.RegisterEvent[[]core.QueueItem]("queueItemsUpdated")
 	application.RegisterEvent[core.QueueStatus]("queueStatus")
 	application.RegisterEvent[bool]("uploadPause")
 	application.RegisterEvent[int64]("uploadCancelItem")

@@ -24,6 +24,8 @@ type queueRecorder struct {
 	starts   int
 	stops    chan struct{}
 	albumErr []AlbumError
+	// updateEvents counts QueueItemsUpdated calls.
+	updateEvents int
 }
 
 func newQueueRecorder() *queueRecorder {
@@ -60,10 +62,13 @@ func (r *queueRecorder) QueueItems(items []QueueItem) {
 	}
 }
 
-func (r *queueRecorder) QueueItemUpdate(item QueueItem) {
+func (r *queueRecorder) QueueItemsUpdated(items []QueueItem) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.items[item.ID] = item
+	r.updateEvents++
+	for _, item := range items {
+		r.items[item.ID] = item
+	}
 }
 
 func (r *queueRecorder) QueueStatus(s QueueStatus) {
@@ -572,5 +577,36 @@ func TestClassifyPairsLivePhotoCopiesPerFolder(t *testing.T) {
 	work, warnings = ClassifyUploadWork(ambiguous, LivePhotoClassificationOptions{Enabled: true, SkipIncomplete: true}, reader)
 	if len(warnings) != 1 || warnings[0].Code != "ambiguous-identifier" || len(work) != 3 {
 		t.Fatalf("work = %+v, warnings = %+v; want three separate uploads and one warning", work, warnings)
+	}
+}
+
+func TestQueueCancelSendsOneUpdateForTheWholeQueue(t *testing.T) {
+	m, rec, up, _ := newTestQueue(t)
+	names := make([]string, 500)
+	for i := range names {
+		names[i] = fmt.Sprintf("IMG_%04d.jpg", i)
+	}
+	paths := writeMedia(t, t.TempDir(), names...)
+
+	m.Upload(paths, testOpts(1))
+	up.waitStarted(t, names[0])
+	waitFor(t, func() bool { return len(m.Items()) == len(names) })
+	rec.mu.Lock()
+	before := rec.updateEvents
+	rec.mu.Unlock()
+
+	m.Cancel()
+	rec.waitStop(t)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	// One event for the queued items, one for the active item ending.
+	if got := rec.updateEvents - before; got > 2 {
+		t.Fatalf("cancel sent %d update events, want at most 2", got)
+	}
+	for _, item := range rec.items {
+		if item.State != QueueItemCancelled {
+			t.Fatalf("%s state = %q, want cancelled", item.Name, item.State)
+		}
 	}
 }
