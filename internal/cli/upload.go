@@ -433,7 +433,7 @@ func finishUpload(model uploadModel, output io.Writer) error {
 func buildUploadSummary(model uploadModel) uploadSummary {
 	warnings := make([]uploadWarning, 0, len(model.warnings))
 	for _, warning := range model.warnings {
-		if warning.Code == "incomplete-live-photo-skipped" || warning.Code == "ambiguous-filename-stem" {
+		if core.IsSkippedPreflightWarning(warning.Code) {
 			continue
 		}
 		warnings = append(warnings, warning)

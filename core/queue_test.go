@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -522,6 +524,14 @@ func TestQueueReportsScanProgress(t *testing.T) {
 type fakeMetadataReader struct {
 	photos map[string]string
 	videos map[string]LivePhotoMetadata
+	areas  map[string]int64
+	hevc   map[string]bool
+}
+
+func (f fakeMetadataReader) MediaInfo(path string) MediaInfo {
+	name := filepath.Base(path)
+	ext := strings.ToLower(filepath.Ext(name))
+	return MediaInfo{PixelArea: f.areas[name], HEVC: f.hevc[name] || ext == ".heic"}
 }
 
 func (f fakeMetadataReader) PhotoContentIdentifier(path string) (string, error) {
@@ -542,6 +552,7 @@ func TestClassifyPairsHEICWhenAnExportedCopySharesTheIdentifier(t *testing.T) {
 	reader := fakeMetadataReader{
 		photos: map[string]string{"IMG_0122.HEIC": "ID-1", "IMG_0122.jpeg": "ID-1"},
 		videos: map[string]LivePhotoMetadata{"IMG_0122.MOV": {ContentIdentifier: "ID-1", HasStillImageTime: true}},
+		hevc:   map[string]bool{"IMG_0122.MOV": true},
 	}
 	work, warnings := ClassifyUploadWork([]string{"/p/IMG_0122.HEIC", "/p/IMG_0122.jpeg", "/p/IMG_0122.MOV"},
 		LivePhotoClassificationOptions{Enabled: true, SkipIncomplete: true}, reader)
@@ -558,6 +569,7 @@ func TestClassifyPairsLivePhotoCopiesPerFolder(t *testing.T) {
 	reader := fakeMetadataReader{
 		photos: map[string]string{"IMG_0140.HEIC": "ID-2"},
 		videos: map[string]LivePhotoMetadata{"IMG_0140.MOV": {ContentIdentifier: "ID-2", HasStillImageTime: true}},
+		hevc:   map[string]bool{"IMG_0140.MOV": true, "IMG_0140(1).MOV": true},
 	}
 	// The same Live Photo copied into two dropped folders.
 	paths := []string{"/a/IMG_0140.HEIC", "/a/IMG_0140.MOV", "/b/IMG_0140.HEIC", "/b/IMG_0140.MOV"}
@@ -571,12 +583,25 @@ func TestClassifyPairsLivePhotoCopiesPerFolder(t *testing.T) {
 		t.Fatalf("work = %+v, want one pair per folder", work)
 	}
 
-	// Two videos in one folder stay ambiguous; their photo still uploads.
+	// Two videos for one still in one folder are ambiguous: all are skipped,
+	// not guessed.
 	ambiguous := []string{"/c/IMG_0140.HEIC", "/c/IMG_0140.MOV", "/c/IMG_0140(1).MOV"}
 	reader.videos["IMG_0140(1).MOV"] = LivePhotoMetadata{ContentIdentifier: "ID-2", HasStillImageTime: true}
 	work, warnings = ClassifyUploadWork(ambiguous, LivePhotoClassificationOptions{Enabled: true, SkipIncomplete: true}, reader)
-	if len(warnings) != 1 || warnings[0].Code != "ambiguous-identifier" || len(work) != 3 {
-		t.Fatalf("work = %+v, warnings = %+v; want three separate uploads and one warning", work, warnings)
+	if len(warnings) != 1 || warnings[0].Code != "ambiguous-identifier" || len(warnings[0].Paths) != 3 || len(work) != 0 {
+		t.Fatalf("work = %+v, warnings = %+v; want all three skipped with one warning", work, warnings)
+	}
+
+	// A HEIC whose only motion is H.264 is a mismatch, not a pair.
+	mismatched := []string{"/d/IMG_0140.HEIC", "/d/IMG_0140.MOV", "/e/IMG_0140.HEIC", "/e/IMG_0140(1).MOV"}
+	reader.hevc["IMG_0140(1).MOV"] = false
+	work, warnings = ClassifyUploadWork(mismatched, LivePhotoClassificationOptions{Enabled: true, SkipIncomplete: true}, reader)
+	pairedInE := false
+	for _, item := range work {
+		pairedInE = pairedInE || (item.Kind == UploadWorkLivePhoto && filepath.Dir(item.LivePhoto.PhotoPath) == "/e")
+	}
+	if pairedInE || len(warnings) != 1 {
+		t.Fatalf("work = %+v, warnings = %+v; want the mismatched folder skipped", work, warnings)
 	}
 }
 
@@ -608,5 +633,100 @@ func TestQueueCancelSendsOneUpdateForTheWholeQueue(t *testing.T) {
 		if item.State != QueueItemCancelled {
 			t.Fatalf("%s state = %q, want cancelled", item.Name, item.State)
 		}
+	}
+}
+
+func TestClassifyPairsTakeoutMP4Motion(t *testing.T) {
+	// Google Takeout: the camera HEIC, an exported JPEG of the same shot, and
+	// the motion as .MP4, all carrying one identifier.
+	reader := fakeMetadataReader{
+		photos: map[string]string{"IMG_0122.HEIC": "ID-3", "IMG_0122.jpeg": "ID-3"},
+		videos: map[string]LivePhotoMetadata{"IMG_0122.MP4": {ContentIdentifier: "ID-3", HasStillImageTime: true}},
+		hevc:   map[string]bool{"IMG_0122.MP4": true},
+	}
+	paths := []string{"/t/IMG_0122.HEIC", "/t/IMG_0122.MP4", "/t/IMG_0122.jpeg", "/t/clip.mp4"}
+	for _, ignoreApple := range []bool{false, true} {
+		work, warnings := ClassifyUploadWork(paths, LivePhotoClassificationOptions{Enabled: true, SkipIncomplete: true, IgnoreAppleMetadata: ignoreApple}, reader)
+		if ignoreApple {
+			// Filename matching cannot tell the HEIC from the JPEG copy; it
+			// only must not warn about the ordinary clip.
+			for _, warning := range warnings {
+				if slices.Contains(warning.Paths, "/t/clip.mp4") {
+					t.Fatalf("ordinary MP4 warned about: %+v", warning)
+				}
+			}
+			continue
+		}
+		if len(warnings) != 0 {
+			t.Fatalf("warnings = %+v", warnings)
+		}
+		var pairs, singles []string
+		for _, item := range work {
+			if item.Kind == UploadWorkLivePhoto {
+				pairs = append(pairs, item.LivePhoto.PhotoPath+"+"+item.LivePhoto.VideoPath)
+			} else {
+				singles = append(singles, item.Single.Path)
+			}
+		}
+		if !slices.Equal(pairs, []string{"/t/IMG_0122.HEIC+/t/IMG_0122.MP4"}) || !slices.Equal(singles, []string{"/t/IMG_0122.jpeg", "/t/clip.mp4"}) {
+			t.Fatalf("pairs = %v, singles = %v", pairs, singles)
+		}
+	}
+}
+
+func TestClassifyMatchesTakeoutCopiesByEncoding(t *testing.T) {
+	// Two Live Photos of one shot, as Google Takeout exports them: the camera
+	// original (HEIC + HEVC motion) and a "Most Compatible" export (JPEG +
+	// H.264). The plain MP4 name belongs to the JPEG, not to the HEIC.
+	newReader := func() fakeMetadataReader {
+		return fakeMetadataReader{
+			photos: map[string]string{"IMG_0122.HEIC": "ID-4", "IMG_0122.jpeg": "ID-4"},
+			videos: map[string]LivePhotoMetadata{
+				"IMG_0122.MP4":    {ContentIdentifier: "ID-4", HasStillImageTime: true},
+				"IMG_0122(1).MP4": {ContentIdentifier: "ID-4", HasStillImageTime: true},
+			},
+			areas: map[string]int64{"IMG_0122.HEIC": 3024 * 4032, "IMG_0122.jpeg": 480 * 640, "IMG_0122.MP4": 720 * 960, "IMG_0122(1).MP4": 1440 * 1920},
+			hevc:  map[string]bool{"IMG_0122(1).MP4": true},
+		}
+	}
+	paths := []string{"/t/IMG_0122(1).MP4", "/t/IMG_0122.HEIC", "/t/IMG_0122.MP4", "/t/IMG_0122.jpeg"}
+	classify := func(reader fakeMetadataReader) (map[string]string, []PreflightWarning, int) {
+		work, warnings := ClassifyUploadWork(paths, LivePhotoClassificationOptions{Enabled: true, SkipIncomplete: true}, reader)
+		pairs := map[string]string{}
+		for _, item := range work {
+			if item.Kind == UploadWorkLivePhoto {
+				pairs[filepath.Base(item.LivePhoto.PhotoPath)] = filepath.Base(item.LivePhoto.VideoPath)
+			}
+		}
+		return pairs, warnings, len(work)
+	}
+	want := map[string]string{"IMG_0122.HEIC": "IMG_0122(1).MP4", "IMG_0122.jpeg": "IMG_0122.MP4"}
+
+	pairs, warnings, _ := classify(newReader())
+	if len(warnings) != 0 || !maps.Equal(pairs, want) {
+		t.Fatalf("pairs = %v, warnings = %+v; want %v", pairs, warnings, want)
+	}
+
+	// A full-resolution JPEG export: encoding still decides, resolution does
+	// not contradict.
+	reader := newReader()
+	reader.areas["IMG_0122.jpeg"] = 3024 * 4032
+	if pairs, warnings, _ = classify(reader); len(warnings) != 0 || !maps.Equal(pairs, want) {
+		t.Fatalf("full-resolution export: pairs = %v, warnings = %+v", pairs, warnings)
+	}
+
+	// Encoding and resolution disagree (the larger still would get the
+	// smaller video): skip everything rather than guess.
+	reader = newReader()
+	reader.areas["IMG_0122.MP4"] = 2160 * 2880
+	if pairs, warnings, n := classify(reader); len(pairs) != 0 || n != 0 || len(warnings) != 1 || warnings[0].Code != "ambiguous-identifier" {
+		t.Fatalf("contradiction: pairs = %v, items = %d, warnings = %+v; want all skipped", pairs, n, warnings)
+	}
+
+	// Both videos H.264: nothing tells them apart, so skip everything.
+	reader = newReader()
+	reader.hevc = nil
+	if pairs, warnings, n := classify(reader); len(pairs) != 0 || n != 0 || len(warnings) != 1 {
+		t.Fatalf("same encoding: pairs = %v, items = %d, warnings = %+v; want all skipped", pairs, n, warnings)
 	}
 }

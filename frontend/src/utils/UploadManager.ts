@@ -53,7 +53,7 @@ export interface AlbumError {
 }
 
 function isSkippedUploadWarning(code: string): boolean {
-  return code === "incomplete-live-photo-skipped" || code === "ambiguous-filename-stem";
+  return code === "incomplete-live-photo-skipped" || code === "ambiguous-filename-stem" || code === "ambiguous-identifier";
 }
 
 export type QueueItemState = "queued" | "active" | "done" | "failed" | "skipped" | "cancelled";

@@ -535,7 +535,7 @@ func (m *UploadManager) addBatchItems(batch *uploadBatch, workItems []UploadWork
 	}
 	var skippedFiles []skippedFile
 	for _, warning := range warnings {
-		if !isSkippedPreflightWarning(warning.Code) {
+		if !IsSkippedPreflightWarning(warning.Code) {
 			continue
 		}
 		for _, path := range warning.Paths {
@@ -1119,8 +1119,10 @@ func (m *UploadManager) reportUpdates(items []QueueItem) {
 	}
 }
 
-func isSkippedPreflightWarning(code string) bool {
-	return code == "incomplete-live-photo-skipped" || code == "ambiguous-filename-stem"
+// IsSkippedPreflightWarning reports whether a preflight warning code means
+// its files were skipped rather than uploaded.
+func IsSkippedPreflightWarning(code string) bool {
+	return code == "incomplete-live-photo-skipped" || code == "ambiguous-filename-stem" || code == "ambiguous-identifier"
 }
 
 func queueKey(path string) string {

@@ -61,6 +61,17 @@ func (fileLivePhotoMetadataReader) VideoLivePhotoMetadata(path string) (LivePhot
 	return ReadVideoLivePhotoMetadata(path)
 }
 
+func (fileLivePhotoMetadataReader) MediaInfo(path string) MediaInfo {
+	return readMediaInfo(path)
+}
+
+// livePhotoMediaInfoReader is an optional LivePhotoMetadataReader extension
+// that describes encoding and resolution, used to match copies of one Live
+// Photo.
+type livePhotoMediaInfoReader interface {
+	MediaInfo(path string) MediaInfo
+}
+
 type indexedLivePhotoMedia struct {
 	path  string
 	index int
@@ -87,6 +98,11 @@ func ClassifyUploadWork(paths []string, options LivePhotoClassificationOptions, 
 	}
 	if reader == nil {
 		reader = fileLivePhotoMetadataReader{}
+	}
+
+	mediaInfo := func(string) MediaInfo { return MediaInfo{} }
+	if infoReader, ok := reader.(livePhotoMediaInfoReader); ok {
+		mediaInfo = infoReader.MediaInfo
 	}
 
 	candidatesByIdentifier := make(map[string]*livePhotoCandidates)
@@ -121,7 +137,15 @@ func ClassifyUploadWork(paths []string, options LivePhotoClassificationOptions, 
 				continue
 			}
 			if err != nil && !errors.Is(err, ErrContentIdentifierMissing) {
-				warnings = append(warnings, metadataReadWarning(path, err))
+				// MP4s are mostly ordinary videos from other cameras; one the
+				// Live Photo reader cannot parse simply uploads on its own.
+				if !strings.EqualFold(filepath.Ext(path), ".mp4") {
+					warnings = append(warnings, metadataReadWarning(path, err))
+				}
+				continue
+			}
+			if !metadata.HasStillImageTime && strings.EqualFold(filepath.Ext(path), ".mp4") {
+				// An ordinary MP4, not Live Photo motion: upload it on its own.
 				continue
 			}
 			if !metadata.HasStillImageTime {
@@ -169,9 +193,10 @@ func ClassifyUploadWork(paths []string, options LivePhotoClassificationOptions, 
 			continue
 		}
 		// Copies of one shot share its identifier. Pair the copies that can be
-		// told apart; the rest upload as separate files.
+		// told apart for certain; any group left in doubt is skipped below.
+		unresolvedCopies := false
 		if !options.IgnoreAppleMetadata && (len(candidates.photos) > 1 || len(candidates.videos) > 1) {
-			pairs, unresolved := resolveDuplicateLivePhotoCandidates(candidates)
+			pairs, unresolved := resolveDuplicateLivePhotoCandidates(candidates, mediaInfo)
 			for _, pair := range pairs {
 				photo, video := pair[0], pair[1]
 				pairsByIndex[min(photo.index, video.index)] = LivePhotoPair{
@@ -186,22 +211,24 @@ func ClassifyUploadWork(paths []string, options LivePhotoClassificationOptions, 
 				continue
 			}
 			candidates = unresolved
+			unresolvedCopies = true
 		}
-		if len(candidates.photos) > 1 || len(candidates.videos) > 1 {
+		if unresolvedCopies || len(candidates.photos) > 1 || len(candidates.videos) > 1 {
 			ambiguousPaths := candidatePaths(candidates)
 			code := "ambiguous-identifier"
-			message := "Uploaded as separate files: these share one Live Photo ID, so they could not be paired"
+			message := "Skipped: several copies share one Live Photo ID and their files do not show which motion belongs to which still. Use Upload anyway to upload them as separate files."
 			if options.IgnoreAppleMetadata {
 				code = "ambiguous-filename-stem"
 				message = "Skipped: these share one filename stem, so they could not be paired"
-				// Filename matching is an explicit override, so ambiguity must skip
-				// every candidate instead of silently falling back to single uploads.
-				for _, photo := range candidates.photos {
-					consumed[photo.index] = true
-				}
-				for _, video := range candidates.videos {
-					consumed[video.index] = true
-				}
+			}
+			// Guessing could permanently attach the wrong motion, and uploading
+			// the copies separately loses the Live Photo, so skip them all and
+			// leave the choice to the user.
+			for _, photo := range candidates.photos {
+				consumed[photo.index] = true
+			}
+			for _, video := range candidates.videos {
+				consumed[video.index] = true
 			}
 			warnings = append(warnings, PreflightWarning{
 				Paths:   ambiguousPaths,
@@ -270,7 +297,9 @@ func livePhotoCandidateType(path string) string {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".heic", ".heif", ".jpg", ".jpeg":
 		return "photo"
-	case ".mov":
+	// Google Takeout exports Live Photo motion as .MP4 with Apple's metadata
+	// intact, so MP4s join pairing when they carry it.
+	case ".mov", ".mp4":
 		return "video"
 	default:
 		return ""
@@ -302,14 +331,20 @@ func metadataReadWarning(path string, err error) PreflightWarning {
 	}
 }
 
-// resolveDuplicateLivePhotoCandidates pairs candidates that share one
-// identifier when the copies can be told apart. A still and its video sit in
-// the same folder, so each folder is matched on its own first; within a
-// folder, or across folders when no folder pairs, the camera's HEIC wins over
-// exported copies. It returns the pairs as [photo, video] and the candidates
-// of folders that remain ambiguous. Leftover single copies are in neither and
-// upload as separate files.
-func resolveDuplicateLivePhotoCandidates(candidates *livePhotoCandidates) ([][2]indexedLivePhotoMedia, *livePhotoCandidates) {
+// resolveDuplicateLivePhotoCandidates pairs copies of one Live Photo that
+// share its identifier, but only when the files leave no doubt which motion
+// belongs to which still: the identifier is Apple's only link, and every copy
+// carries it. A still and its video sit in the same folder, so each folder is
+// matched on its own first, falling back to all folders together when no
+// folder pairs. Within a group, stills and videos are matched by encoding
+// (HEIC with HEVC; exported JPEG with H.264), and only when each encoding has
+// exactly one still and one video and their resolutions do not contradict
+// the match.
+//
+// It returns the pairs as [photo, video] and the candidates of groups that
+// remain ambiguous. Leftover stills without a video of their own are in
+// neither and upload as separate files.
+func resolveDuplicateLivePhotoCandidates(candidates *livePhotoCandidates, mediaInfo func(string) MediaInfo) ([][2]indexedLivePhotoMedia, *livePhotoCandidates) {
 	byDir := make(map[string]*livePhotoCandidates)
 	var dirs []string
 	group := func(path string) *livePhotoCandidates {
@@ -329,59 +364,88 @@ func resolveDuplicateLivePhotoCandidates(candidates *livePhotoCandidates) ([][2]
 		g.videos = append(g.videos, video)
 	}
 
-	pairInGroup := func(g *livePhotoCandidates) (*[2]indexedLivePhotoMedia, bool) {
-		if len(g.videos) != 1 {
-			return nil, false
-		}
-		if len(g.photos) == 1 {
-			return &[2]indexedLivePhotoMedia{g.photos[0], g.videos[0]}, true
-		}
-		if photo, ok := originalLivePhotoStill(g.photos); ok {
-			return &[2]indexedLivePhotoMedia{photo, g.videos[0]}, true
-		}
-		return nil, false
-	}
-
 	var pairs [][2]indexedLivePhotoMedia
 	unresolved := &livePhotoCandidates{}
 	for _, dir := range dirs {
 		g := byDir[dir]
-		if pair, ok := pairInGroup(g); ok {
-			pairs = append(pairs, *pair)
+		if len(g.videos) == 0 {
+			continue // stills only: they upload as separate files
+		}
+		if groupPairs, ok := pairCopies(g.photos, g.videos, mediaInfo); ok {
+			pairs = append(pairs, groupPairs...)
 			continue
 		}
-		if len(g.photos) > 1 || len(g.videos) > 1 {
-			unresolved.photos = append(unresolved.photos, g.photos...)
-			unresolved.videos = append(unresolved.videos, g.videos...)
-		}
+		unresolved.photos = append(unresolved.photos, g.photos...)
+		unresolved.videos = append(unresolved.videos, g.videos...)
 	}
 	if len(pairs) == 0 && len(unresolved.photos) == 0 && len(unresolved.videos) == 0 {
-		// Still and video sit in different folders: match across them.
-		if pair, ok := pairInGroup(candidates); ok {
-			return [][2]indexedLivePhotoMedia{*pair}, unresolved
+		// Stills and videos sit in different folders: match across them.
+		if allPairs, ok := pairCopies(candidates.photos, candidates.videos, mediaInfo); ok {
+			return allPairs, unresolved
 		}
 		return nil, candidates
 	}
 	return pairs, unresolved
 }
 
-// originalLivePhotoStill picks the still to pair when several photos share a
-// Live Photo identifier: the single HEIC/HEIF among them, which is what the
-// camera wrote. It fails when there is no single such photo.
-func originalLivePhotoStill(photos []indexedLivePhotoMedia) (indexedLivePhotoMedia, bool) {
-	if len(photos) < 2 {
-		return indexedLivePhotoMedia{}, false
+// pairCopies matches stills to videos by encoding. It succeeds only when
+// every video has exactly one still of the same encoding, at most one video
+// is camera-original (HEVC) and one exported (H.264), and, with two pairs, the
+// higher-resolution still is not given the lower-resolution video. Anything
+// else is ambiguous. A still without a video of its encoding is left out and
+// uploads on its own.
+func pairCopies(photos, videos []indexedLivePhotoMedia, mediaInfo func(string) MediaInfo) ([][2]indexedLivePhotoMedia, bool) {
+	if len(videos) == 0 || len(videos) > 2 {
+		return nil, false
 	}
-	var found indexedLivePhotoMedia
-	count := 0
-	for _, photo := range photos {
-		switch strings.ToLower(filepath.Ext(photo.path)) {
-		case ".heic", ".heif":
-			found = photo
-			count++
+	type classified struct {
+		media indexedLivePhotoMedia
+		info  MediaInfo
+	}
+	byEncoding := func(media []indexedLivePhotoMedia) map[bool][]classified {
+		classes := make(map[bool][]classified)
+		for _, m := range media {
+			info := mediaInfo(m.path)
+			classes[info.HEVC] = append(classes[info.HEVC], classified{m, info})
+		}
+		return classes
+	}
+	stills, motions := byEncoding(photos), byEncoding(videos)
+
+	var pairs [][2]indexedLivePhotoMedia
+	var matched [][2]classified
+	for _, hevc := range []bool{true, false} {
+		if len(motions[hevc]) == 0 {
+			continue
+		}
+		if len(motions[hevc]) != 1 || len(stills[hevc]) != 1 {
+			return nil, false
+		}
+		matched = append(matched, [2]classified{stills[hevc][0], motions[hevc][0]})
+		pairs = append(pairs, [2]indexedLivePhotoMedia{stills[hevc][0].media, motions[hevc][0].media})
+	}
+	if len(matched) == 2 {
+		first, second := matched[0], matched[1]
+		stillOrder := compareArea(first[0].info, second[0].info)
+		videoOrder := compareArea(first[1].info, second[1].info)
+		if stillOrder*videoOrder < 0 {
+			return nil, false // the higher-resolution still would get the lower-resolution video
 		}
 	}
-	return found, count == 1
+	return pairs, true
+}
+
+// compareArea returns 1, -1 or 0 as a is larger, smaller or the same size as
+// b, or 0 when either size is unknown.
+func compareArea(a, b MediaInfo) int {
+	switch {
+	case a.PixelArea <= 0 || b.PixelArea <= 0 || a.PixelArea == b.PixelArea:
+		return 0
+	case a.PixelArea > b.PixelArea:
+		return 1
+	default:
+		return -1
+	}
 }
 
 func candidatePaths(candidates *livePhotoCandidates) []string {
