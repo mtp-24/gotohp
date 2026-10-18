@@ -15,6 +15,7 @@ import { Events } from '@wailsio/runtime'
 import Button from "./components/ui/button/Button.vue"
 import GoogleAccountSelect from './components/GoogleAccountSelect.vue'
 import GoogleAuthSetup from "./components/GoogleAuthSetup.vue"
+import DropZones from "./components/DropZones.vue"
 import './index.css'
 import SettingsPanel from "./SettingsPanel.vue"
 import Upload from './Upload.vue'
@@ -140,12 +141,6 @@ onMounted(async () => {
 })
 
 
-
-const dropZones = [
-  { id: 'regular', title: 'Upload Only', description: 'Upload files without adding to any album' },
-  { id: 'album', title: 'Upload to Album', description: "Upload and add to a specific album (you'll enter the name)" },
-  { id: 'auto-album', title: 'Auto Album', description: 'Upload and create one album per folder, named after the folder' },
-]
 
 // Global drag event handlers to detect file dragging
 let dragLeaveTimeout: ReturnType<typeof setTimeout> | null = null
@@ -349,36 +344,20 @@ onUnmounted(() => {
     class="relative w-screen h-screen flex flex-col items-center"
     style="--wails-draggable: drag"
   >
-    <!-- Drop zones, shown over any view while files are dragged in. The zones
-         tile the whole window with no gaps: a drop outside every target is
-         silently ignored by Wails. -->
+    <!-- While the queue is showing, the drop zones cover it during a drag. The
+         home screen shows them all the time instead. -->
     <div
-      v-if="isDraggingFiles && options.length > 0"
+      v-if="isDraggingFiles && showQueue && options.length > 0"
       class="absolute inset-0 z-40 flex flex-col bg-background"
       style="--wails-draggable: none"
     >
-      <p
-        v-if="showQueue"
-        class="pointer-events-none absolute top-2 inset-x-0 text-center text-xs text-muted-foreground select-none"
-      >
+      <p class="pointer-events-none absolute top-2 inset-x-0 text-center text-xs text-muted-foreground select-none">
         Files dropped now join the current queue
       </p>
-      <div
-        v-for="(zone, index) in dropZones"
-        :key="zone.id"
-        data-file-drop-target
-        :data-drop-zone="zone.id"
-        :class="['flex-1 flex px-4 py-1.5', index === 0 && 'pt-8', index === dropZones.length - 1 && 'pb-4']"
-      >
-        <div class="drop-zone flex-1 flex flex-col items-center justify-center border-2 border-dashed border-muted-foreground/50 rounded-xl transition-all duration-200">
-          <h2 class="text-xl font-semibold select-none text-muted-foreground">
-            {{ zone.title }}
-          </h2>
-          <p class="text-sm text-muted-foreground/70 mt-2 select-none text-center px-4">
-            {{ zone.description }}
-          </p>
-        </div>
-      </div>
+      <DropZones
+        edge-padding
+        class="flex-1"
+      />
     </div>
 
     <!-- Album name prompt for files dropped on the album zone -->
@@ -440,11 +419,15 @@ onUnmounted(() => {
       <Upload />
     </div>
 
-    <!-- Home -->
+    <!-- Home. Drops outside the zones count as Upload Only. -->
     <div
       v-else
-      class="w-screen h-screen flex flex-col items-center gap-4 max-w-md px-6 pt-30"
+      :class="[
+        'w-full h-screen flex flex-col items-center gap-4 px-6',
+        options.length === 0 ? 'pt-30' : 'pt-12 pb-6',
+      ]"
       data-file-drop-target
+      data-drop-zone="regular"
     >
       <template v-if="options.length === 0">
         <div class="flex max-w-xs flex-col items-center gap-4 text-center">
@@ -470,7 +453,7 @@ onUnmounted(() => {
 
       <template v-else>
         <h1 class="text-xl font-semibold select-none">
-          Drop files to upload
+          Drop files on a zone to upload
         </h1>
         <GoogleAccountSelect
           v-model="selectedOption"
@@ -511,6 +494,11 @@ onUnmounted(() => {
             </TooltipProvider>
           </SheetContent>
         </Sheet>
+
+        <DropZones
+          class="w-full max-w-3xl flex-1 min-h-0"
+          style="--wails-draggable: none"
+        />
       </template>
     </div>
     <GoogleAuthSetup
