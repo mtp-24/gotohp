@@ -6,7 +6,10 @@ import { ScrollArea } from "./components/ui/scroll-area"
 import ThreadProgress from "./components/ThreadProgress.vue"
 import QueueItemRow from "./components/QueueItemRow.vue"
 import { uploadManager, type QueueItem, type QueueItemState } from './utils/UploadManager'
-import { X, Clock, Zap, FolderPlus, AlertTriangle, Pause, Play, RotateCcw, Trash2, WifiOff, Copy, Hourglass, Upload as UploadIcon } from '@lucide/vue'
+import { Sheet, SheetContent, SheetTrigger } from './components/ui/sheet'
+import { TooltipProvider } from './components/ui/tooltip'
+import SettingsPanel from './SettingsPanel.vue'
+import { Settings, X, Clock, Zap, FolderPlus, AlertTriangle, Pause, Play, RotateCcw, Trash2, WifiOff, Copy, Hourglass, Upload as UploadIcon } from '@lucide/vue'
 
 const { state } = uploadManager
 
@@ -37,11 +40,16 @@ onUnmounted(() => {
   }
 })
 
+// One slot per running worker, kept while it waits between files so the list
+// does not grow and shrink with every item. Workers that finished drop out.
 const threadsList = computed(() => {
+  if (!state.isUploading) return []
   return Array.from(state.threads.values())
-    .filter(thread => thread.Status !== 'idle')
+    .filter(thread => !(thread.Status === 'idle' && thread.Message === 'Finished'))
     .sort((a, b) => a.WorkerID - b.WorkerID)
 })
+// Rows still busy with a file, for matching queue items to their progress.
+const busyThreads = computed(() => threadsList.value.filter(thread => thread.Status !== 'idle'))
 
 type Filter = 'all' | QueueItemState
 
@@ -98,7 +106,7 @@ function setFilter(value: Filter) {
   visibleCount.value = pageSize
 }
 
-const activeThreadFor = (item: QueueItem) => threadsList.value.find(thread => thread.FilePath === item.Path)
+const activeThreadFor = (item: QueueItem) => busyThreads.value.find(thread => thread.FilePath === item.Path)
 
 // Format bytes to human readable
 function formatBytes(bytes: number, decimals = 1): string {
@@ -218,7 +226,25 @@ async function copyResults() {
     style="--wails-draggable: none"
   >
     <!-- Header -->
-    <div class="text-center">
+    <div class="relative text-center">
+      <Sheet>
+        <SheetTrigger as-child>
+          <button
+            class="absolute right-0 top-0 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground cursor-pointer"
+            title="Settings"
+          >
+            <Settings :size="16" />
+          </button>
+        </SheetTrigger>
+        <SheetContent side="bottom">
+          <p class="px-4 pt-4 text-xs text-muted-foreground">
+            Changes apply to files you add from now on. Items already in the queue keep the settings they were added with.
+          </p>
+          <TooltipProvider disable-hoverable-content>
+            <SettingsPanel />
+          </TooltipProvider>
+        </SheetContent>
+      </Sheet>
       <p class="text-2xl font-bold tabular-nums">
         {{ runFinished }}<span class="text-muted-foreground font-normal">/</span><span class="text-muted-foreground">{{ runTotal }}</span>
       </p>

@@ -26,6 +26,8 @@ const statusConfig = computed(() => {
       return { color: 'text-yellow-500', bg: 'bg-yellow-500/10', label: 'Checking' }
     case 'finalizing':
       return { color: 'text-purple-500', bg: 'bg-purple-500/10', label: 'Finalizing' }
+    case 'idle':
+      return { color: 'text-muted-foreground', bg: 'bg-muted', label: 'Waiting' }
     default:
       return { color: 'text-muted-foreground', bg: 'bg-muted', label: props.thread.Status }
   }
@@ -57,12 +59,14 @@ const statusMessage = computed(() => props.thread.Message.replace(/^Error:\s*/, 
 </script>
 
 <template>
-  <div class="px-2.5 py-2 bg-card border rounded-md">
-    <!-- Top row: status badge + filename -->
-    <div class="flex items-center gap-2 mb-1">
-      <span 
+  <!-- Fixed height: the second line is always there, as a progress bar while
+       bytes are sent and as one truncated status line otherwise, so rows do
+       not change size as a file moves through its stages. -->
+  <div class="h-[46px] px-2.5 py-1.5 bg-card border rounded-md flex flex-col justify-between overflow-hidden">
+    <div class="flex items-center gap-2 min-w-0">
+      <span
         :class="[
-          'text-[10px] font-medium px-1.5 py-0.5 rounded',
+          'shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded',
           statusConfig.color,
           statusConfig.bg
         ]"
@@ -70,39 +74,33 @@ const statusMessage = computed(() => props.thread.Message.replace(/^Error:\s*/, 
         {{ statusConfig.label }}
       </span>
       <span
-        v-if="thread.FileName"
-        class="flex-1 text-xs truncate"
-        :title="thread.FilePath"
+        class="flex-1 min-w-0 text-xs truncate"
+        :class="thread.FileName ? '' : 'text-muted-foreground'"
+        :title="thread.FilePath || thread.Message"
       >
-        {{ thread.FileName }}
+        {{ thread.FileName || 'Waiting for the next file' }}
       </span>
       <span
-        v-else
-        class="flex-1 text-xs truncate text-muted-foreground"
+        v-if="uploadPercent !== null"
+        class="shrink-0 text-[10px] text-muted-foreground tabular-nums"
       >
-        {{ thread.Message }}
+        {{ fileSizeDisplay }} · {{ uploadPercent }}%
       </span>
     </div>
-
-    <!-- Progress bar (only when uploading) -->
-    <template v-if="uploadPercent !== null">
-      <Progress
-        :model-value="uploadPercent"
-        class="h-1 mb-1"
-      />
-      <div class="flex justify-between text-[10px] text-muted-foreground tabular-nums">
-        <span>{{ fileSizeDisplay }}</span>
-        <span>{{ uploadPercent }}%</span>
-      </div>
-    </template>
+    <Progress
+      v-if="uploadPercent !== null"
+      :model-value="uploadPercent"
+      class="h-1"
+    />
     <p
-      v-else-if="thread.Status === 'error' || thread.Status === 'skipped'"
+      v-else
       :class="[
-        'mt-1 text-[11px] leading-snug break-words',
+        'text-[10px] leading-tight truncate',
         thread.Status === 'error' ? 'text-destructive' : 'text-muted-foreground'
       ]"
+      :title="statusMessage"
     >
-      {{ statusMessage }}
+      {{ thread.Status === 'idle' ? '\u00a0' : statusMessage }}
     </p>
   </div>
 </template>

@@ -63,14 +63,17 @@ const canUploadAnyway = computed(() => props.item.State === 'skipped' && !!props
       >
         {{ item.Name }}
       </p>
+      <!-- Always present so rows keep one height as items change state. -->
       <p
-        v-if="detail"
         :class="[
-          'text-[10px] leading-snug break-words',
+          'text-[10px] leading-snug',
+          // Live progress changes constantly: keep it to one line.
+          item.State === 'active' ? 'truncate' : 'break-words',
           item.State === 'failed' ? 'text-destructive' : 'text-muted-foreground'
         ]"
+        :title="detail"
       >
-        {{ detail }}
+        {{ detail || '\u00a0' }}
       </p>
     </div>
     <button
