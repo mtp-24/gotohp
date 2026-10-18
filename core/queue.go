@@ -168,6 +168,12 @@ type UploadManager struct {
 
 	albumMu   sync.Mutex
 	albumKeys map[string]string
+	// albumLists holds the account's existing albums, listed once per
+	// account in the background, so drops into an album that already exists
+	// add to it instead of creating a duplicate. Guarded by albumListMu, not
+	// albumMu, which album passes hold for as long as they run.
+	albumListMu sync.Mutex
+	albumLists  map[string]*albumList
 
 	// Network, upload and album hooks, replaced in tests.
 	probe         func(ctx context.Context, proxy string) error
@@ -175,6 +181,14 @@ type UploadManager struct {
 	newApi        func(ApiOptions) (*Api, error)
 	uploadItem    func(ctx context.Context, api *Api, item UploadWorkItem, opts UploadOptions, workerID int, reporter UploadReporter) (mediaKey string, skipped, existed bool, err error)
 	newAlbumAPI   func(ApiOptions) (albumAPI, error)
+	listAlbums    func(context.Context, ApiOptions) ([]LibraryAlbum, error)
+}
+
+// albumList is one account's existing albums by title, once listed.
+type albumList struct {
+	done    chan struct{}
+	byTitle map[string][]LibraryAlbum
+	err     error
 }
 
 // NewUploadManager creates a manager that reports progress to reporter. A nil
@@ -197,6 +211,7 @@ func NewUploadManager(reporter UploadReporter, logger *slog.Logger) *UploadManag
 		itemPaths:     make(map[string]int),
 		scans:         make(map[*uploadBatch]struct{}),
 		albumKeys:     make(map[string]string),
+		albumLists:    make(map[string]*albumList),
 		probe:         probeGooglePhotos,
 		probeInterval: defaultNetworkProbeInterval,
 		newApi:        NewApi,
@@ -207,6 +222,13 @@ func NewUploadManager(reporter UploadReporter, logger *slog.Logger) *UploadManag
 				return nil, err
 			}
 			return api, nil
+		},
+		listAlbums: func(ctx context.Context, opts ApiOptions) ([]LibraryAlbum, error) {
+			api, err := NewApi(opts)
+			if err != nil {
+				return nil, err
+			}
+			return api.ListAlbums(ctx)
 		},
 	}
 	m.cond = sync.NewCond(&m.mu)
@@ -239,7 +261,67 @@ func (m *UploadManager) Upload(paths []string, opts UploadOptions) {
 	m.tasks++
 	m.mu.Unlock()
 
+	if opts.AlbumAutoMode || (opts.AlbumName != "" && !IsAlbumKey(opts.AlbumName)) {
+		m.startAlbumListing(opts.Api)
+	}
 	go m.preflight(batch, paths)
+}
+
+// startAlbumListing lists the account's albums in the background, once per
+// account, ready for the album pass at the end of the batch. Listing reads
+// the whole library sync, which can take a minute on a large library; the
+// uploads usually take longer.
+func (m *UploadManager) startAlbumListing(opts ApiOptions) {
+	m.albumListMu.Lock()
+	defer m.albumListMu.Unlock()
+	if _, ok := m.albumLists[opts.Account]; ok {
+		return
+	}
+	list := &albumList{done: make(chan struct{})}
+	m.albumLists[opts.Account] = list
+	go func() {
+		defer close(list.done)
+		albums, err := m.listAlbums(context.Background(), opts)
+		if err != nil {
+			list.err = err
+			return
+		}
+		list.byTitle = make(map[string][]LibraryAlbum)
+		for _, album := range albums {
+			list.byTitle[album.Title] = append(list.byTitle[album.Title], album)
+		}
+	}()
+}
+
+// existingAlbums waits for the account's album list. It returns nil, after
+// warning, when the albums could not be listed: new albums are then created
+// as before.
+func (m *UploadManager) existingAlbums(ctx context.Context, opts ApiOptions) *albumList {
+	m.albumListMu.Lock()
+	list := m.albumLists[opts.Account]
+	m.albumListMu.Unlock()
+	if list == nil {
+		return nil
+	}
+	select {
+	case <-list.done:
+	case <-ctx.Done():
+		return nil
+	}
+	if list.err != nil {
+		m.reporter.Warning(PreflightWarning{
+			Code:    "album-lookup-failed",
+			Message: fmt.Sprintf("Could not check for existing albums, so new albums may duplicate existing ones: %v", list.err),
+		})
+		// Try again on the next album pass.
+		m.albumListMu.Lock()
+		if m.albumLists[opts.Account] == list {
+			delete(m.albumLists, opts.Account)
+		}
+		m.albumListMu.Unlock()
+		return nil
+	}
+	return list
 }
 
 // startRunLocked begins a run if none is active. A run that was cancelled but
@@ -1168,10 +1250,11 @@ func (m *UploadManager) handleAlbumCreation(ctx context.Context, opts UploadOpti
 		return
 	}
 	albumManager := NewAlbumManager(api, m.reporter, m.logger, ctx.Done())
+	existing := m.existingAlbums(ctx, opts.Api)
 
 	if opts.AlbumAutoMode {
 		for _, group := range groupUploadsByFolder(uploads) {
-			m.addToSessionAlbum(albumManager, "dir:"+group.dir, group.name, group.mediaKeys)
+			m.addToSessionAlbum(albumManager, existing, "dir:"+group.dir, group.name, group.mediaKeys)
 		}
 		return
 	}
@@ -1182,21 +1265,49 @@ func (m *UploadManager) handleAlbumCreation(ctx context.Context, opts UploadOpti
 	for _, upload := range uploads {
 		mediaKeys = append(mediaKeys, upload.mediaKey)
 	}
-	m.addToSessionAlbum(albumManager, "name:"+opts.AlbumName, opts.AlbumName, mediaKeys)
+	m.addToSessionAlbum(albumManager, existing, "name:"+opts.AlbumName, opts.AlbumName, mediaKeys)
 }
 
-// addToSessionAlbum adds media to the album cached under cacheKey, creating it
-// on first use so repeated drops into the same album do not make duplicates.
-func (m *UploadManager) addToSessionAlbum(albumManager *AlbumManager, cacheKey, nameOrKey string, mediaKeys []string) {
+// addToSessionAlbum adds media to an album named nameOrKey without creating
+// a duplicate: it reuses an album used earlier this session (cached under
+// cacheKey), else an existing album with exactly that title, and creates one
+// only when neither exists. existing may be nil when albums could not be
+// listed.
+func (m *UploadManager) addToSessionAlbum(albumManager *AlbumManager, existing *albumList, cacheKey, nameOrKey string, mediaKeys []string) {
 	var albumKeys []string
 	var err error
-	if existing, ok := m.albumKeys[cacheKey]; ok && !IsAlbumKey(nameOrKey) {
-		albumKeys, err = albumManager.addToExistingAlbum(mediaKeys, existing, nameOrKey)
-	} else {
+	cached, isCached := m.albumKeys[cacheKey]
+	match, matched := pickExistingAlbum(existing, nameOrKey, len(mediaKeys))
+	switch {
+	case IsAlbumKey(nameOrKey):
 		albumKeys, err = albumManager.AddToAlbum(mediaKeys, nameOrKey)
-		if err == nil && len(albumKeys) == 1 && !IsAlbumKey(nameOrKey) {
-			m.albumKeys[cacheKey] = albumKeys[0]
+	case isCached:
+		albumKeys, err = albumManager.addToExistingAlbum(mediaKeys, cached, nameOrKey)
+	case matched:
+		if same := len(existing.byTitle[nameOrKey]); same > 1 {
+			m.reporter.Warning(PreflightWarning{
+				Code:    "album-name-repeated",
+				Message: fmt.Sprintf("%d albums are named %q; added to the one with the most items", same, nameOrKey),
+			})
 		}
+		albumKeys, err = albumManager.addToExistingAlbum(mediaKeys, match.MediaKey, nameOrKey)
+		if err == nil {
+			m.albumKeys[cacheKey] = match.MediaKey
+		}
+	default:
+		albumKeys, err = albumManager.AddToAlbum(mediaKeys, nameOrKey)
+		if err == nil && len(albumKeys) == 1 {
+			m.albumKeys[cacheKey] = albumKeys[0]
+			if existing != nil {
+				// Later drops with this name, even from another folder, reuse it.
+				existing.byTitle[nameOrKey] = append(existing.byTitle[nameOrKey], LibraryAlbum{
+					MediaKey: albumKeys[0], Title: nameOrKey, ItemCount: len(mediaKeys),
+				})
+			}
+		}
+	}
+	if err == nil && (isCached || matched) {
+		m.albumAdded(existing, nameOrKey, albumKeys, len(mediaKeys))
 	}
 	if err != nil {
 		m.logger.Error("album update failed", "album", nameOrKey, "error", err)
@@ -1204,6 +1315,38 @@ func (m *UploadManager) addToSessionAlbum(albumManager *AlbumManager, cacheKey, 
 		return
 	}
 	m.logger.Info("album updated", "album", nameOrKey, "items", len(mediaKeys), "albumKeys", albumKeys)
+}
+
+// pickExistingAlbum returns the existing album titled name to add count items
+// to: with several, the one with the most items, skipping any the items would
+// push past the album limit.
+func pickExistingAlbum(existing *albumList, name string, count int) (LibraryAlbum, bool) {
+	if existing == nil || IsAlbumKey(name) {
+		return LibraryAlbum{}, false
+	}
+	var best LibraryAlbum
+	found := false
+	for _, album := range existing.byTitle[name] {
+		if album.ItemCount+count > AlbumLimit {
+			continue
+		}
+		if !found || album.ItemCount > best.ItemCount {
+			best, found = album, true
+		}
+	}
+	return best, found
+}
+
+// albumAdded keeps the cached item count of a reused album current.
+func (m *UploadManager) albumAdded(existing *albumList, name string, albumKeys []string, count int) {
+	if existing == nil || len(albumKeys) != 1 {
+		return
+	}
+	for i, album := range existing.byTitle[name] {
+		if album.MediaKey == albumKeys[0] {
+			existing.byTitle[name][i].ItemCount += count
+		}
+	}
 }
 
 type folderUploads struct {

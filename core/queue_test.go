@@ -163,6 +163,8 @@ type fakeAlbums struct {
 	mu      sync.Mutex
 	created map[string][]string
 	added   map[string][]string
+	// existing are the albums the account already has.
+	existing []LibraryAlbum
 }
 
 func (a *fakeAlbums) CreateAlbum(name string, keys []string) (string, error) {
@@ -188,6 +190,7 @@ func newTestQueue(t *testing.T) (*UploadManager, *queueRecorder, *fakeUploads, *
 	m.newApi = func(ApiOptions) (*Api, error) { return &Api{}, nil }
 	m.uploadItem = uploads.upload
 	m.newAlbumAPI = func(ApiOptions) (albumAPI, error) { return albums, nil }
+	m.listAlbums = func(context.Context, ApiOptions) ([]LibraryAlbum, error) { return albums.existing, nil }
 	m.probe = func(context.Context, string) error { return nil }
 	m.probeInterval = 10 * time.Millisecond
 	return m, recorder, uploads, albums
@@ -747,5 +750,72 @@ func TestHasItemPathTracksQueuedFilesOnly(t *testing.T) {
 	m.ClearFinished()
 	if m.HasItemPath(paths[0]) {
 		t.Fatal("path still known after the list was cleared")
+	}
+}
+
+func TestQueueReusesAnExistingAlbumWithTheSameName(t *testing.T) {
+	m, rec, up, albums := newTestQueue(t)
+	albums.existing = []LibraryAlbum{
+		{MediaKey: "AF1Qip-small", Title: "Trip", ItemCount: 3},
+		{MediaKey: "AF1Qip-big", Title: "Trip", ItemCount: 40},
+		{MediaKey: "AF1Qip-other", Title: "Other", ItemCount: 99},
+	}
+	opts := testOpts(1)
+	opts.AlbumName = "Trip"
+	m.Upload(writeMedia(t, t.TempDir(), "a.jpg"), opts)
+	up.waitStarted(t, "a.jpg")
+	up.gate("a.jpg") <- nil
+	rec.waitStop(t)
+
+	if len(albums.created) != 0 {
+		t.Fatalf("created %v, want the existing album reused", albums.created)
+	}
+	if !slices.Equal(albums.added["AF1Qip-big"], []string{"key-a.jpg"}) {
+		t.Fatalf("added = %v, want the larger of the two albums named Trip", albums.added)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if !slices.ContainsFunc(rec.warnings, func(w PreflightWarning) bool { return w.Code == "album-name-repeated" }) {
+		t.Fatal("no warning that two albums share the name")
+	}
+}
+
+func TestQueueAutoAlbumReusesExistingFolderAlbum(t *testing.T) {
+	m, rec, up, albums := newTestQueue(t)
+	albums.existing = []LibraryAlbum{{MediaKey: "AF1Qip-jan", Title: "Jan", ItemCount: 5}}
+	opts := testOpts(1)
+	opts.AlbumAutoMode = true
+	m.Upload(writeMedia(t, t.TempDir(), "Jan/a.jpg", "Feb/b.jpg"), opts)
+	for range 2 {
+		name := <-up.started
+		up.gate(name) <- nil
+	}
+	rec.waitStop(t)
+
+	if !slices.Equal(albums.added["AF1Qip-jan"], []string{"key-a.jpg"}) {
+		t.Fatalf("added = %v, want a.jpg in the existing Jan album", albums.added)
+	}
+	if !slices.Equal(albums.created["Feb"], []string{"key-b.jpg"}) || len(albums.created) != 1 {
+		t.Fatalf("created = %v, want only a new Feb album", albums.created)
+	}
+}
+
+func TestQueueCreatesAlbumWhenListingFails(t *testing.T) {
+	m, rec, up, albums := newTestQueue(t)
+	m.listAlbums = func(context.Context, ApiOptions) ([]LibraryAlbum, error) { return nil, errors.New("offline") }
+	opts := testOpts(1)
+	opts.AlbumName = "Trip"
+	m.Upload(writeMedia(t, t.TempDir(), "a.jpg"), opts)
+	up.waitStarted(t, "a.jpg")
+	up.gate("a.jpg") <- nil
+	rec.waitStop(t)
+
+	if !slices.Equal(albums.created["Trip"], []string{"key-a.jpg"}) {
+		t.Fatalf("created = %v, want a new album after the lookup failed", albums.created)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if !slices.ContainsFunc(rec.warnings, func(w PreflightWarning) bool { return w.Code == "album-lookup-failed" }) {
+		t.Fatal("no warning that existing albums could not be checked")
 	}
 }

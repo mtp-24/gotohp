@@ -388,7 +388,7 @@ onUnmounted(() => {
           autofocus
         />
         <p class="text-[11px] text-muted-foreground">
-          Using the same name again this session adds to the same album.
+          If an album with this exact name already exists, files are added to it instead of making a new one.
         </p>
         <div class="flex gap-4 justify-center mt-4">
           <Button
