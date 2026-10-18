@@ -430,6 +430,18 @@ export class QueueStatus {
      */
     "WaitingForNetwork": boolean;
 
+    /**
+     * StoppedReason explains a pause the queue imposed itself, such as a full
+     * account. Resuming clears it.
+     */
+    "StoppedReason": string;
+
+    /**
+     * RateLimitedUntil is when a pause after HTTP 429 ends, in Unix
+     * milliseconds, or 0.
+     */
+    "RateLimitedUntil": number;
+
     /** Creates a new QueueStatus instance. */
     constructor($$source: Partial<QueueStatus> = {}) {
         if (!("Paused" in $$source)) {
@@ -437,6 +449,12 @@ export class QueueStatus {
         }
         if (!("WaitingForNetwork" in $$source)) {
             this["WaitingForNetwork"] = false;
+        }
+        if (!("StoppedReason" in $$source)) {
+            this["StoppedReason"] = "";
+        }
+        if (!("RateLimitedUntil" in $$source)) {
+            this["RateLimitedUntil"] = 0;
         }
 
         Object.assign(this, $$source);

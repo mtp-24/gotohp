@@ -12,6 +12,8 @@ const { state } = uploadManager
 
 // Elapsed time ticker
 const elapsedSeconds = ref(0)
+// Wall clock, refreshed by the ticker for countdowns.
+const now = ref(Date.now())
 let elapsedInterval: ReturnType<typeof setInterval> | null = null
 // Speed smoothed over roughly the last ten seconds, so the ETA does not jump
 // with every progress sample.
@@ -19,6 +21,7 @@ const smoothedSpeed = ref(0)
 
 onMounted(() => {
   elapsedInterval = setInterval(() => {
+    now.value = Date.now()
     if (state.startTime > 0 && state.isUploading) {
       elapsedSeconds.value = Math.floor((Date.now() - state.startTime) / 1000)
       smoothedSpeed.value = smoothedSpeed.value === 0
@@ -114,7 +117,7 @@ const elapsedDisplay = computed(() => formatDuration(elapsedSeconds.value))
 // Time left for the queued and active items: remaining bytes over the smoothed
 // speed, or, before any bytes move, the average time per finished item.
 const etaDisplay = computed(() => {
-  if (!state.isUploading || state.queueStatus.Paused || state.queueStatus.WaitingForNetwork) return '--'
+  if (!state.isUploading || state.queueStatus.Paused || state.queueStatus.WaitingForNetwork || state.queueStatus.RateLimitedUntil > 0) return '--'
   const remainingItems = runItems.value.length - runFinished.value
   if (remainingItems <= 0) return '--'
   const remainingBytes = state.totalBytes - state.uploadedBytes
@@ -139,9 +142,17 @@ const albumProgressPercent = computed(() => {
 
 const hasPendingUploads = computed(() => counts.value.queued > 0 || counts.value.active > 0)
 
+// Seconds until a rate-limit pause ends.
+const rateLimitSeconds = computed(() => {
+  const until = state.queueStatus.RateLimitedUntil
+  return until > 0 ? Math.max(0, Math.ceil((until - now.value) / 1000)) : 0
+})
+
 const statusLabel = computed(() => {
   if (!state.isUploading) return 'Finished'
+  if (state.queueStatus.StoppedReason) return 'Stopped'
   if (state.queueStatus.WaitingForNetwork) return 'Waiting for connection'
+  if (state.queueStatus.RateLimitedUntil > 0) return `Rate limited by Google, resuming in ${formatDuration(rateLimitSeconds.value)}`
   if (state.queueStatus.Paused) return counts.value.active > 0 ? 'Pausing after current items' : 'Paused'
   if (!hasPendingUploads.value && state.isCreatingAlbum) return 'Adding to album'
   if (!hasPendingUploads.value) return 'Scanning'
@@ -272,6 +283,19 @@ async function copyResults() {
           Clear list
         </Button>
       </template>
+    </div>
+
+    <div
+      v-if="state.isUploading && state.queueStatus.StoppedReason"
+      class="flex gap-2 rounded-md bg-destructive/10 px-2.5 py-2 text-xs text-destructive"
+    >
+      <AlertTriangle
+        :size="14"
+        class="mt-0.5 shrink-0"
+      />
+      <p class="leading-snug">
+        {{ state.queueStatus.StoppedReason }}
+      </p>
     </div>
 
     <!-- Album creation progress -->

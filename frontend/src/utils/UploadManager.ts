@@ -76,6 +76,10 @@ export interface QueueItem {
 export interface QueueStatus {
   Paused: boolean;
   WaitingForNetwork: boolean;
+  // Set when the queue stopped itself, e.g. because the account is full.
+  StoppedReason: string;
+  // End of a pause after HTTP 429, in Unix milliseconds, or 0.
+  RateLimitedUntil: number;
 }
 
 export interface UploadState {
@@ -109,7 +113,7 @@ class UploadManager {
     isUploading: false,
     items: [],
     runId: 0,
-    queueStatus: { Paused: false, WaitingForNetwork: false },
+    queueStatus: { Paused: false, WaitingForNetwork: false, StoppedReason: "", RateLimitedUntil: 0 },
     totalFiles: 0,
     uploadedFiles: 0,
     threads: new Map<number, ThreadStatus>(),
@@ -173,7 +177,7 @@ class UploadManager {
         this.state.startTime = Date.now();
         this.state.uploadSpeed = 0;
         this.state.albumStatus = null;
-        this.state.queueStatus = { Paused: false, WaitingForNetwork: false };
+        this.state.queueStatus = { Paused: false, WaitingForNetwork: false, StoppedReason: "", RateLimitedUntil: 0 };
         this.lastSpeedUpdate = Date.now();
         this.lastBytesUploaded = 0;
         this.speedSamples = [];

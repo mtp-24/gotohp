@@ -67,8 +67,8 @@ func ShouldRetry(resp *http.Response, err error) bool {
 	if resp == nil {
 		return true
 	}
-	// Retry on 5xx server errors and 429 (rate limit)
-	return resp.StatusCode >= 500 || resp.StatusCode == 429
+	// Retry on 5xx server errors, 408 (request timeout) and 429 (rate limit)
+	return resp.StatusCode >= 500 || resp.StatusCode == 408 || resp.StatusCode == 429
 }
 
 // CalculateBackoff returns the delay for a given attempt (exponential backoff with jitter)

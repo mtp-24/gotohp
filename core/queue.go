@@ -48,6 +48,12 @@ type QueueStatus struct {
 	Paused bool `json:"Paused"`
 	// WaitingForNetwork is set while uploads are held after a connection loss.
 	WaitingForNetwork bool `json:"WaitingForNetwork"`
+	// StoppedReason explains a pause the queue imposed itself, such as a full
+	// account. Resuming clears it.
+	StoppedReason string `json:"StoppedReason"`
+	// RateLimitedUntil is when a pause after HTTP 429 ends, in Unix
+	// milliseconds, or 0.
+	RateLimitedUntil int64 `json:"RateLimitedUntil"`
 }
 
 // QueueReporter is implemented by reporters that track individual queue items.
@@ -66,6 +72,13 @@ const (
 	// connection loss before it is reported as failed.
 	maxNetworkRequeues          = 5
 	defaultNetworkProbeInterval = 5 * time.Second
+)
+
+// Pauses after HTTP 429 start here and double on each repeat, up to the cap.
+// Variables so tests can shorten them.
+var (
+	rateLimitPauseStart = 60 * time.Second
+	rateLimitPauseMax   = 10 * time.Minute
 )
 
 type queueEntry struct {
@@ -109,6 +122,9 @@ type UploadManager struct {
 	scanning          int
 	paused            bool
 	waitingForNetwork bool
+	stoppedReason     string
+	rateLimitedUntil  time.Time
+	rateLimitPause    time.Duration
 	total             int
 
 	runCtx      context.Context
@@ -208,6 +224,9 @@ func (m *UploadManager) startRunLocked() {
 	m.running = true
 	m.paused = false
 	m.waitingForNetwork = false
+	m.stoppedReason = ""
+	m.rateLimitedUntil = time.Time{}
+	m.rateLimitPause = 0
 	m.total = 0
 	m.albumCtx, m.albumCancel = context.WithCancel(context.Background())
 	// Emitted under the lock so no item event of this run can precede it.
@@ -243,6 +262,7 @@ func (m *UploadManager) Cancel() {
 	}
 	m.pending = nil
 	m.waitingForNetwork = false
+	m.rateLimitedUntil = time.Time{}
 	m.cond.Broadcast()
 	m.reportStatusLocked()
 	m.mu.Unlock()
@@ -260,10 +280,13 @@ func (m *UploadManager) Cancel() {
 func (m *UploadManager) SetPaused(paused bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.paused == paused {
+	if m.paused == paused && (paused || m.stoppedReason == "") {
 		return
 	}
 	m.paused = paused
+	if !paused {
+		m.stoppedReason = ""
+	}
 	m.cond.Broadcast()
 	m.reportStatusLocked()
 }
@@ -388,7 +411,15 @@ func (m *UploadManager) Items() []QueueItem {
 func (m *UploadManager) Status() QueueStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return QueueStatus{Paused: m.paused, WaitingForNetwork: m.waitingForNetwork}
+	return m.statusLocked()
+}
+
+func (m *UploadManager) statusLocked() QueueStatus {
+	status := QueueStatus{Paused: m.paused, WaitingForNetwork: m.waitingForNetwork, StoppedReason: m.stoppedReason}
+	if !m.rateLimitedUntil.IsZero() {
+		status.RateLimitedUntil = m.rateLimitedUntil.UnixMilli()
+	}
+	return status
 }
 
 func (m *UploadManager) preflight(batch *uploadBatch, paths []string) {
@@ -656,7 +687,7 @@ func (m *UploadManager) nextItem() (*queueEntry, context.Context, QueueItem) {
 		if m.runCtx.Err() != nil {
 			return nil, nil, QueueItem{}
 		}
-		if !m.paused && !m.waitingForNetwork && len(m.pending) > 0 {
+		if !m.paused && !m.waitingForNetwork && m.rateLimitedUntil.IsZero() && len(m.pending) > 0 {
 			entry := m.pending[0]
 			m.pending = m.pending[1:]
 			entry.item.State = QueueItemActive
@@ -713,6 +744,17 @@ func (m *UploadManager) runWorker(workerID int) {
 func (m *UploadManager) finishItem(workerID int, entry *queueEntry, ctx context.Context, mediaKey string, skipped, existed bool, err error) {
 	path := entry.item.Path
 	cancelled := err != nil && ctx.Err() != nil
+	apiErr, isAPIErr := asAPIError(err)
+	accountProblem := ""
+	if err != nil && !cancelled && mediaKey == "" && isAPIErr {
+		switch {
+		case apiErr.StorageFull():
+			accountProblem = "Your Google account is out of storage. Free up space in Google Photos, then press Resume."
+		case apiErr.CredentialRejected():
+			accountProblem = "Google rejected this account's credential. Add the account again, then press Resume."
+		}
+	}
+	rateLimited := err != nil && !cancelled && mediaKey == "" && isAPIErr && apiErr.RateLimited()
 	network := err != nil && !cancelled && mediaKey == "" && isNetworkError(err)
 
 	m.mu.Lock()
@@ -728,6 +770,32 @@ func (m *UploadManager) finishItem(workerID int, entry *queueEntry, ctx context.
 		entry.item.State = QueueItemCancelled
 		entry.item.Message = "Cancelled"
 		threadStatus.Status, threadStatus.Message = "idle", "Cancelled"
+	case accountProblem != "" && m.runCtx.Err() == nil:
+		// Nothing else can upload either, so stop the queue rather than fail
+		// every remaining item in turn.
+		entry.item.State = QueueItemQueued
+		entry.item.Message = accountProblem
+		m.pending = append([]*queueEntry{entry}, m.pending...)
+		requeued = true
+		threadStatus.Status, threadStatus.Message = "idle", "Queue stopped"
+		if m.stoppedReason == "" {
+			m.paused = true
+			m.stoppedReason = accountProblem
+			m.reportStatusLocked()
+		}
+	case rateLimited && m.runCtx.Err() == nil:
+		entry.item.State = QueueItemQueued
+		entry.item.Message = "Google is rate limiting uploads; waiting before retrying"
+		m.pending = append([]*queueEntry{entry}, m.pending...)
+		requeued = true
+		threadStatus.Status, threadStatus.Message = "idle", "Rate limited"
+		if m.rateLimitedUntil.IsZero() {
+			m.rateLimitPause = min(max(rateLimitPauseStart, m.rateLimitPause*2), rateLimitPauseMax)
+			m.rateLimitedUntil = time.Now().Add(m.rateLimitPause)
+			m.tasks++
+			go m.holdForRateLimit(m.rateLimitPause)
+			m.reportStatusLocked()
+		}
 	case network && entry.networkErrors < maxNetworkRequeues && m.runCtx.Err() == nil:
 		entry.networkErrors++
 		entry.item.State = QueueItemQueued
@@ -766,6 +834,7 @@ func (m *UploadManager) finishItem(workerID int, entry *queueEntry, ctx context.
 		entry.item.State = QueueItemDone
 		entry.item.MediaKey = mediaKey
 		entry.item.Message = ""
+		m.rateLimitPause = 0
 		result = &FileUploadResult{IsLivePhoto: entry.item.IsLivePhoto, Path: path, Paths: entry.item.Paths, MediaKey: mediaKey}
 		threadStatus.Status, threadStatus.Message = "completed", "Completed"
 	}
@@ -857,6 +926,24 @@ func (m *UploadManager) startAlbumPass(batch *uploadBatch) {
 	}()
 }
 
+// holdForRateLimit keeps workers from starting items until the pause ends.
+func (m *UploadManager) holdForRateLimit(delay time.Duration) {
+	defer m.taskDone()
+	m.mu.Lock()
+	runCtx := m.runCtx
+	m.mu.Unlock()
+	select {
+	case <-time.After(delay):
+	case <-runCtx.Done():
+	}
+	m.mu.Lock()
+	m.rateLimitedUntil = time.Time{}
+	m.spawnWorkersLocked(m.maxThreadsLocked())
+	m.cond.Broadcast()
+	m.reportStatusLocked()
+	m.mu.Unlock()
+}
+
 // waitForNetwork holds the queue until Google Photos is reachable again.
 func (m *UploadManager) waitForNetwork(proxy string) {
 	defer m.taskDone()
@@ -910,6 +997,8 @@ func (m *UploadManager) taskDone() {
 	m.running = false
 	m.paused = false
 	m.waitingForNetwork = false
+	m.stoppedReason = ""
+	m.rateLimitedUntil = time.Time{}
 	m.runCancel()
 	m.albumCancel()
 	// Emitted under the lock so a new run cannot start before this one ends.
@@ -919,7 +1008,7 @@ func (m *UploadManager) taskDone() {
 
 func (m *UploadManager) reportStatusLocked() {
 	if m.queue != nil {
-		m.queue.QueueStatus(QueueStatus{Paused: m.paused, WaitingForNetwork: m.waitingForNetwork})
+		m.queue.QueueStatus(m.statusLocked())
 	}
 }
 

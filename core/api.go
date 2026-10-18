@@ -33,6 +33,7 @@ type Api struct {
 	client            *http.Client
 	authResponseCache map[string]string
 	commitEndpoint    string
+	authEndpoint      string
 	commitRetryConfig *RetryConfig
 	saver             bool
 	useQuota          bool
@@ -177,11 +178,11 @@ func (a *Api) getAuthToken() (map[string]string, error) {
 		"User-Agent":      "GoogleAuth/1.4 (Pixel XL PQ2A.190205.001); gzip",
 	}
 
-	req, err := http.NewRequest(
-		"POST",
-		"https://android.googleapis.com/auth",
-		strings.NewReader(authRequestData.Encode()),
-	)
+	authEndpoint := a.authEndpoint
+	if authEndpoint == "" {
+		authEndpoint = "https://android.googleapis.com/auth"
+	}
+	req, err := http.NewRequest("POST", authEndpoint, strings.NewReader(authRequestData.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -192,14 +193,13 @@ func (a *Api) getAuthToken() (map[string]string, error) {
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("auth request failed after retries: %w", err)
+		return nil, fmt.Errorf("auth request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := ReadResponseBody(resp)
-		return make(map[string]string), fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+		return make(map[string]string), newAPIError(resp)
 	}
 
 	// Parse the response body
@@ -220,6 +220,10 @@ func (a *Api) getAuthToken() (map[string]string, error) {
 			parsedAuthResponse[parts[0]] = parts[1]
 		}
 	}
+	// A dead master token can come back as HTTP 200 with an Error= line.
+	if authErr := parsedAuthResponse["Error"]; authErr != "" {
+		return nil, &APIError{StatusCode: resp.StatusCode, Code: rpcCodeUnauthenticated, Message: "Google sign-in failed: " + authErr}
+	}
 	if err := decryptTokenEncryptedResponse(parsedAuthResponse, tokenBinding); err != nil {
 		return nil, err
 	}
@@ -233,6 +237,49 @@ func (a *Api) getAuthToken() (map[string]string, error) {
 	}
 
 	return parsedAuthResponse, nil
+}
+
+// send performs a request authenticated with the account's bearer token.
+// When Google answers 401 or 403 the cached token is dropped and the request
+// is sent once more with a fresh one, since an expired token looks the same
+// as a revoked credential.
+func (a *Api) send(newRequest func() (*http.Request, error)) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		bearerToken, err := a.BearerToken()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get bearer token: %w", err)
+		}
+		req, err := newRequest()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+		resp, err := a.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("request failed: %w", err)
+		}
+		if attempt == 0 && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			_ = resp.Body.Close()
+			a.invalidateBearerToken()
+			continue
+		}
+		return resp, nil
+	}
+}
+
+func (a *Api) invalidateBearerToken() {
+	a.authResponseCache = map[string]string{"Expiry": "0", "Auth": ""}
+}
+
+func newPostRequest(url string, body []byte, headers map[string]string) (*http.Request, error) {
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	return req, nil
 }
 
 // Obtain a file upload token from the Google Photos API.
@@ -252,49 +299,27 @@ func (a *Api) GetUploadToken(shaHashB64 string, fileSize int64) (string, error) 
 		return "", fmt.Errorf("failed to marshal protobuf: %w", err)
 	}
 
-	// Get the bearer token
-	bearerToken, err := a.BearerToken()
-	if err != nil {
-		return "", fmt.Errorf("failed to get bearer token: %w", err)
-	}
-
 	// Prepare headers
 	headers := map[string]string{
 		"Accept-Encoding":         "gzip",
 		"Accept-Language":         a.language,
 		"Content-Type":            "application/x-protobuf",
 		"User-Agent":              a.userAgent,
-		"Authorization":           "Bearer " + bearerToken,
 		"X-Goog-Hash":             "sha1=" + shaHashB64,
 		"X-Upload-Content-Length": strconv.Itoa(int(fileSize)),
 	}
 
-	// Create the request
-	req, err := http.NewRequest(
-		"POST",
-		"https://photos.googleapis.com/data/upload/uploadmedia/interactive",
-		bytes.NewReader(serializedData),
-	)
+	resp, err := a.send(func() (*http.Request, error) {
+		return newPostRequest("https://photos.googleapis.com/data/upload/uploadmedia/interactive", serializedData, headers)
+	})
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-
-	// Make the request
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
+		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := ReadResponseBody(resp)
-		return "", fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+		return "", newAPIError(resp)
 	}
 
 	// Get the upload token from headers
@@ -326,47 +351,25 @@ func (a *Api) FindRemoteMediaByHash(shaHash []byte) (string, error) {
 		return "", fmt.Errorf("failed to marshal protobuf: %w", err)
 	}
 
-	// Get the bearer token
-	bearerToken, err := a.BearerToken()
-	if err != nil {
-		return "", fmt.Errorf("failed to get bearer token: %w", err)
-	}
-
 	// Prepare headers
 	headers := map[string]string{
 		"Accept-Encoding": "gzip",
 		"Accept-Language": a.language,
 		"Content-Type":    "application/x-protobuf",
 		"User-Agent":      a.userAgent,
-		"Authorization":   "Bearer " + bearerToken,
 	}
 
-	// Create the request
-	req, err := http.NewRequest(
-		"POST",
-		"https://photosdata-pa.googleapis.com/6439526531001121323/5084965799730810217",
-		bytes.NewReader(serializedData),
-	)
+	resp, err := a.send(func() (*http.Request, error) {
+		return newPostRequest("https://photosdata-pa.googleapis.com/6439526531001121323/5084965799730810217", serializedData, headers)
+	})
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-
-	// Make the request
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
+		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := ReadResponseBody(resp)
-		return "", fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+		return "", newAPIError(resp)
 	}
 
 	// Parse the response body
@@ -504,8 +507,7 @@ func (a *Api) doUploadRequest(ctx context.Context, uploadURL string, reader io.R
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := ReadResponseBody(resp)
-		return ScottyFinalizeToken{}, ShouldRetry(resp, nil), fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+		return ScottyFinalizeToken{}, ShouldRetry(resp, nil), newAPIError(resp)
 	}
 
 	bodyBytes, err := ReadResponseBody(resp)
@@ -615,17 +617,11 @@ func (a *Api) commitSerialized(serializedData []byte) (string, error) {
 }
 
 func (a *Api) doCommitRequest(serializedData []byte) (mediaKey string, retryable bool, err error) {
-	bearerToken, err := a.BearerToken()
-	if err != nil {
-		return "", true, fmt.Errorf("failed to get bearer token: %w", err)
-	}
-
 	headers := map[string]string{
 		"accept-Encoding":          "gzip",
 		"accept-Language":          a.language,
 		"content-Type":             "application/x-protobuf",
 		"user-Agent":               a.userAgent,
-		"authorization":            "Bearer " + bearerToken,
 		"x-goog-ext-173412678-bin": "CgcIAhClARgC",
 		"x-goog-ext-174067345-bin": "CgIIAg==",
 	}
@@ -634,23 +630,19 @@ func (a *Api) doCommitRequest(serializedData []byte) (mediaKey string, retryable
 	if endpoint == "" {
 		endpoint = photosCreateMediaItemsEndpoint
 	}
-	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(serializedData))
+	resp, err := a.send(func() (*http.Request, error) {
+		return newPostRequest(endpoint, serializedData, headers)
+	})
 	if err != nil {
-		return "", false, fmt.Errorf("failed to create request: %w", err)
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return "", true, fmt.Errorf("request failed: %w", err)
+		// Network and token-refresh failures are worth retrying; a credential
+		// Google refused is not.
+		_, rejected := asAPIError(err)
+		return "", !rejected, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := ReadResponseBody(resp)
-		return "", ShouldRetry(resp, nil), fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+		return "", ShouldRetry(resp, nil), newAPIError(resp)
 	}
 
 	bodyBytes, err := ReadResponseBody(resp)
@@ -717,49 +709,27 @@ func (a *Api) CreateAlbum(albumName string, mediaKeys []string) (string, error) 
 		return "", fmt.Errorf("failed to marshal protobuf: %w", err)
 	}
 
-	// Get the bearer token
-	bearerToken, err := a.BearerToken()
-	if err != nil {
-		return "", fmt.Errorf("failed to get bearer token: %w", err)
-	}
-
 	// Prepare headers
 	headers := map[string]string{
 		"Accept-Encoding":          "gzip",
 		"Accept-Language":          a.language,
 		"Content-Type":             "application/x-protobuf",
 		"User-Agent":               a.userAgent,
-		"Authorization":            "Bearer " + bearerToken,
 		"x-goog-ext-173412678-bin": "CgcIAhClARgC",
 		"x-goog-ext-174067345-bin": "CgIIAg==",
 	}
 
-	// Create the request
-	req, err := http.NewRequest(
-		"POST",
-		"https://photosdata-pa.googleapis.com/6439526531001121323/8386163679468898444",
-		bytes.NewReader(serializedData),
-	)
+	resp, err := a.send(func() (*http.Request, error) {
+		return newPostRequest("https://photosdata-pa.googleapis.com/6439526531001121323/8386163679468898444", serializedData, headers)
+	})
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-
-	// Make the request
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
+		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := ReadResponseBody(resp)
-		return "", fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+		return "", newAPIError(resp)
 	}
 
 	// Parse the response body
@@ -807,49 +777,27 @@ func (a *Api) AddMediaToAlbum(albumMediaKey string, mediaKeys []string) error {
 		return fmt.Errorf("failed to marshal protobuf: %w", err)
 	}
 
-	// Get the bearer token
-	bearerToken, err := a.BearerToken()
-	if err != nil {
-		return fmt.Errorf("failed to get bearer token: %w", err)
-	}
-
 	// Prepare headers
 	headers := map[string]string{
 		"Accept-Encoding":          "gzip",
 		"Accept-Language":          a.language,
 		"Content-Type":             "application/x-protobuf",
 		"User-Agent":               a.userAgent,
-		"Authorization":            "Bearer " + bearerToken,
 		"x-goog-ext-173412678-bin": "CgcIAhClARgC",
 		"x-goog-ext-174067345-bin": "CgIIAg==",
 	}
 
-	// Create the request
-	req, err := http.NewRequest(
-		"POST",
-		"https://photosdata-pa.googleapis.com/6439526531001121323/484917746253879292",
-		bytes.NewReader(serializedData),
-	)
+	resp, err := a.send(func() (*http.Request, error) {
+		return newPostRequest("https://photosdata-pa.googleapis.com/6439526531001121323/484917746253879292", serializedData, headers)
+	})
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-
-	// Make the request
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
+		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := ReadResponseBody(resp)
-		return fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+		return newAPIError(resp)
 	}
 
 	return nil
