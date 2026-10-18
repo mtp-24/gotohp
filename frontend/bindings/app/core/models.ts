@@ -353,6 +353,12 @@ export class QueueItem {
     "Message": string;
     "MediaKey": string;
 
+    /**
+     * SkipCode is set on items skipped before upload, such as incomplete Live
+     * Photos; those can still be uploaded as ordinary files.
+     */
+    "SkipCode": string;
+
     /** Creates a new QueueItem instance. */
     constructor($$source: Partial<QueueItem> = {}) {
         if (!("ID" in $$source)) {
@@ -384,6 +390,9 @@ export class QueueItem {
         }
         if (!("MediaKey" in $$source)) {
             this["MediaKey"] = "";
+        }
+        if (!("SkipCode" in $$source)) {
+            this["SkipCode"] = "";
         }
 
         Object.assign(this, $$source);
@@ -442,6 +451,11 @@ export class QueueStatus {
      */
     "RateLimitedUntil": number;
 
+    /**
+     * Scan describes dropped files still being scanned.
+     */
+    "Scan": ScanProgress;
+
     /** Creates a new QueueStatus instance. */
     constructor($$source: Partial<QueueStatus> = {}) {
         if (!("Paused" in $$source)) {
@@ -456,6 +470,9 @@ export class QueueStatus {
         if (!("RateLimitedUntil" in $$source)) {
             this["RateLimitedUntil"] = 0;
         }
+        if (!("Scan" in $$source)) {
+            this["Scan"] = (new ScanProgress());
+        }
 
         Object.assign(this, $$source);
     }
@@ -464,8 +481,60 @@ export class QueueStatus {
      * Creates a new QueueStatus instance from a string or object.
      */
     static createFrom($$source: any = {}): QueueStatus {
+        const $$createField4_0 = $$createType3;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("Scan" in $$parsedSource) {
+            $$parsedSource["Scan"] = $$createField4_0($$parsedSource["Scan"]);
+        }
         return new QueueStatus($$parsedSource as Partial<QueueStatus>);
+    }
+}
+
+/**
+ * ScanProgress sums the drops still being scanned before their files queue.
+ */
+export class ScanProgress {
+    /**
+     * Phase is "finding" while folders are walked, "checking" while Live Photo
+     * metadata is read, or "" when nothing is being scanned.
+     */
+    "Phase": string;
+
+    /**
+     * Found counts files selected for upload so far.
+     */
+    "Found": number;
+
+    /**
+     * Checked and Total count files whose Live Photo metadata was read.
+     */
+    "Checked": number;
+    "Total": number;
+
+    /** Creates a new ScanProgress instance. */
+    constructor($$source: Partial<ScanProgress> = {}) {
+        if (!("Phase" in $$source)) {
+            this["Phase"] = "";
+        }
+        if (!("Found" in $$source)) {
+            this["Found"] = 0;
+        }
+        if (!("Checked" in $$source)) {
+            this["Checked"] = 0;
+        }
+        if (!("Total" in $$source)) {
+            this["Total"] = 0;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new ScanProgress instance from a string or object.
+     */
+    static createFrom($$source: any = {}): ScanProgress {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new ScanProgress($$parsedSource as Partial<ScanProgress>);
     }
 }
 
@@ -592,3 +661,4 @@ export class UploadBatchStart {
 const $$createType0 = AccountSummary.createFrom;
 const $$createType1 = $Create.Array($$createType0);
 const $$createType2 = $Create.Array($Create.Any);
+const $$createType3 = ScanProgress.createFrom;

@@ -41,6 +41,9 @@ type QueueItem struct {
 	State       QueueItemState `json:"State"`
 	Message     string         `json:"Message"`
 	MediaKey    string         `json:"MediaKey"`
+	// SkipCode is set on items skipped before upload, such as incomplete Live
+	// Photos; those can still be uploaded as ordinary files.
+	SkipCode string `json:"SkipCode"`
 }
 
 // QueueStatus is the queue-wide state shown alongside the items.
@@ -54,7 +57,24 @@ type QueueStatus struct {
 	// RateLimitedUntil is when a pause after HTTP 429 ends, in Unix
 	// milliseconds, or 0.
 	RateLimitedUntil int64 `json:"RateLimitedUntil"`
+	// Scan describes dropped files still being scanned.
+	Scan ScanProgress `json:"Scan"`
 }
+
+// ScanProgress sums the drops still being scanned before their files queue.
+type ScanProgress struct {
+	// Phase is "finding" while folders are walked, "checking" while Live Photo
+	// metadata is read, or "" when nothing is being scanned.
+	Phase string `json:"Phase"`
+	// Found counts files selected for upload so far.
+	Found int `json:"Found"`
+	// Checked and Total count files whose Live Photo metadata was read.
+	Checked int `json:"Checked"`
+	Total   int `json:"Total"`
+}
+
+// scanReportInterval throttles scan progress events.
+const scanReportInterval = 200 * time.Millisecond
 
 // QueueReporter is implemented by reporters that track individual queue items.
 // Reporters that only need run totals, such as the CLI, can ignore it.
@@ -96,6 +116,7 @@ type uploadBatch struct {
 	opts      UploadOptions
 	ctx       context.Context
 	scanning  bool
+	scan      ScanProgress
 	remaining int
 	// uploads holds items that ended with a media key since the last album pass.
 	uploads []albumUpload
@@ -138,6 +159,8 @@ type UploadManager struct {
 	pending     []*queueEntry
 	inQueue     map[string]*queueEntry
 	workerSlots []bool
+	scans       map[*uploadBatch]struct{}
+	lastScanAt  time.Time
 
 	albumMu   sync.Mutex
 	albumKeys map[string]string
@@ -167,6 +190,7 @@ func NewUploadManager(reporter UploadReporter, logger *slog.Logger) *UploadManag
 		logger:        logger,
 		items:         make(map[int64]*queueEntry),
 		inQueue:       make(map[string]*queueEntry),
+		scans:         make(map[*uploadBatch]struct{}),
 		albumKeys:     make(map[string]string),
 		probe:         probeGooglePhotos,
 		probeInterval: defaultNetworkProbeInterval,
@@ -203,8 +227,10 @@ func (m *UploadManager) Upload(paths []string, opts UploadOptions) {
 	m.mu.Lock()
 	m.startRunLocked()
 	m.nextBatchID++
-	batch := &uploadBatch{id: m.nextBatchID, opts: opts, ctx: m.runCtx, scanning: true}
+	batch := &uploadBatch{id: m.nextBatchID, opts: opts, ctx: m.runCtx, scanning: true, scan: ScanProgress{Phase: "finding"}}
+	m.scans[batch] = struct{}{}
 	m.scanning++
+	m.reportStatusLocked()
 	m.tasks++
 	m.mu.Unlock()
 
@@ -333,12 +359,32 @@ func (m *UploadManager) RetryFailed() {
 	m.retry(func(entry *queueEntry) bool { return entry.item.State == QueueItemFailed })
 }
 
+// UploadSkipped queues every file that preflight skipped, such as incomplete
+// Live Photos, to be uploaded as an ordinary file.
+func (m *UploadManager) UploadSkipped() {
+	m.retry(func(entry *queueEntry) bool { return entry.item.State == QueueItemSkipped })
+}
+
+// retryable reports whether an item can go back on the queue: failed and
+// cancelled items, and files preflight skipped.
+func (e *queueEntry) retryable() bool {
+	if e.work.Kind == "" {
+		return false
+	}
+	switch e.item.State {
+	case QueueItemFailed, QueueItemCancelled:
+		return true
+	case QueueItemSkipped:
+		return e.item.SkipCode != ""
+	}
+	return false
+}
+
 func (m *UploadManager) retry(match func(*queueEntry) bool) {
 	m.mu.Lock()
 	var retried []*queueEntry
 	for _, entry := range m.items {
-		state := entry.item.State
-		if (state != QueueItemFailed && state != QueueItemCancelled) || entry.work.Kind == "" || !match(entry) {
+		if !entry.retryable() || !match(entry) {
 			continue
 		}
 		if _, queued := m.inQueue[entry.key]; queued {
@@ -360,6 +406,7 @@ func (m *UploadManager) retry(match func(*queueEntry) bool) {
 		}
 		entry.item.State = QueueItemQueued
 		entry.item.Message = ""
+		entry.item.SkipCode = ""
 		entry.networkErrors = 0
 		entry.batch.remaining++
 		m.total++
@@ -419,6 +466,14 @@ func (m *UploadManager) statusLocked() QueueStatus {
 	if !m.rateLimitedUntil.IsZero() {
 		status.RateLimitedUntil = m.rateLimitedUntil.UnixMilli()
 	}
+	for batch := range m.scans {
+		status.Scan.Found += batch.scan.Found
+		status.Scan.Checked += batch.scan.Checked
+		status.Scan.Total += batch.scan.Total
+		if status.Scan.Phase == "" || batch.scan.Phase == "checking" {
+			status.Scan.Phase = batch.scan.Phase
+		}
+	}
 	return status
 }
 
@@ -427,7 +482,9 @@ func (m *UploadManager) preflight(batch *uploadBatch, paths []string) {
 	opts := batch.opts
 	cancelled := func() bool { return batch.ctx.Err() != nil }
 
-	targetPaths, scanWarnings, err := filterGooglePhotosFilesWithWarnings(paths, opts, cancelled)
+	targetPaths, scanWarnings, err := filterGooglePhotosFilesWithWarnings(paths, opts, cancelled, func(found int) {
+		m.updateScan(batch, func(scan *ScanProgress) { scan.Found = found })
+	})
 	if err != nil {
 		if !cancelled() {
 			m.reporter.FileResult(FileUploadResult{IsError: true, Error: err, ErrorMessage: err.Error()})
@@ -441,6 +498,11 @@ func (m *UploadManager) preflight(batch *uploadBatch, paths []string) {
 		SkipIncomplete:      opts.SkipIncompleteLivePhotos,
 		IgnoreAppleMetadata: opts.IgnoreAppleMetadata,
 		Cancelled:           cancelled,
+		Progress: func(done, total int) {
+			m.updateScan(batch, func(scan *ScanProgress) {
+				scan.Phase, scan.Checked, scan.Total = "checking", done, total
+			})
+		},
 	}, nil)
 	if cancelled() {
 		m.scanFinished(batch)
@@ -463,6 +525,25 @@ func (m *UploadManager) addBatchItems(batch *uploadBatch, workItems []UploadWork
 		key  string
 		size int64
 	}
+	// Files skipped by preflight become one item each, ready to be uploaded
+	// as ordinary files if the user asks.
+	type skippedFile struct {
+		path, code, message string
+		size                int64
+	}
+	var skippedFiles []skippedFile
+	for _, warning := range warnings {
+		if !isSkippedPreflightWarning(warning.Code) {
+			continue
+		}
+		for _, path := range warning.Paths {
+			var size int64
+			if info, err := os.Stat(path); err == nil {
+				size = info.Size()
+			}
+			skippedFiles = append(skippedFiles, skippedFile{path: path, code: warning.Code, message: warning.Message, size: size})
+		}
+	}
 	candidates := make([]candidate, 0, len(workItems))
 	for _, work := range workItems {
 		var size int64
@@ -481,19 +562,17 @@ func (m *UploadManager) addBatchItems(batch *uploadBatch, workItems []UploadWork
 	}
 	var added []QueueItem
 	var skipped []*queueEntry
-	var skipCodes []string
 	var duplicates []string
 	var bytesDelta int64
-	for _, warning := range warnings {
-		if !isSkippedPreflightWarning(warning.Code) {
-			continue
-		}
-		entry := m.newEntryLocked(batch, UploadWorkItem{}, warning.Paths, true, 0)
+	for _, file := range skippedFiles {
+		work := UploadWorkItem{Kind: UploadWorkSingle, Single: &SingleMedia{Path: file.path}}
+		entry := m.newEntryLocked(batch, work, []string{file.path}, false, file.size)
+		entry.key = queueKey(file.path)
 		entry.item.State = QueueItemSkipped
-		entry.item.Message = warning.Message
+		entry.item.Message = file.message
+		entry.item.SkipCode = file.code
 		m.total++
 		skipped = append(skipped, entry)
-		skipCodes = append(skipCodes, warning.Code)
 		added = append(added, entry.item)
 	}
 	for _, c := range candidates {
@@ -528,11 +607,11 @@ func (m *UploadManager) addBatchItems(batch *uploadBatch, workItems []UploadWork
 			Message: fmt.Sprintf("%d item(s) are already in the queue and were not added again", len(duplicates)),
 		})
 	}
-	for i, entry := range skipped {
+	for _, entry := range skipped {
 		m.reporter.FileResult(FileUploadResult{
 			IsLivePhoto: true,
 			Skipped:     true,
-			SkipCode:    skipCodes[i],
+			SkipCode:    entry.item.SkipCode,
 			SkipReason:  entry.item.Message,
 			Path:        entry.item.Path,
 			Paths:       entry.item.Paths,
@@ -629,9 +708,23 @@ func (m *UploadManager) newEntryLocked(batch *uploadBatch, work UploadWorkItem, 
 	return entry
 }
 
+// updateScan records a batch's scan progress and reports it, at most every
+// scanReportInterval.
+func (m *UploadManager) updateScan(batch *uploadBatch, update func(*ScanProgress)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	update(&batch.scan)
+	if now := time.Now(); now.Sub(m.lastScanAt) >= scanReportInterval {
+		m.lastScanAt = now
+		m.reportStatusLocked()
+	}
+}
+
 func (m *UploadManager) scanFinished(batch *uploadBatch) {
 	m.mu.Lock()
 	batch.scanning = false
+	delete(m.scans, batch)
+	m.reportStatusLocked()
 	m.scanning--
 	finalize := m.batchDoneLocked(batch)
 	m.cond.Broadcast()

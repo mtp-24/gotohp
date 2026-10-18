@@ -42,6 +42,8 @@ type LivePhotoClassificationOptions struct {
 	SkipIncomplete      bool
 	IgnoreAppleMetadata bool
 	Cancelled           func() bool
+	// Progress, when set, is called as each file's metadata is checked.
+	Progress func(done, total int)
 }
 
 type LivePhotoMetadataReader interface {
@@ -92,6 +94,9 @@ func ClassifyUploadWork(paths []string, options LivePhotoClassificationOptions, 
 	for index, path := range paths {
 		if options.Cancelled != nil && options.Cancelled() {
 			return nil, nil
+		}
+		if options.Progress != nil {
+			options.Progress(index+1, len(paths))
 		}
 		switch livePhotoCandidateType(path) {
 		case "photo":
@@ -163,13 +168,32 @@ func ClassifyUploadWork(paths []string, options LivePhotoClassificationOptions, 
 			consumed[video.index] = true
 			continue
 		}
+		// Copies of one shot share its identifier. Pair the copies that can be
+		// told apart; the rest upload as separate files.
+		if !options.IgnoreAppleMetadata && (len(candidates.photos) > 1 || len(candidates.videos) > 1) {
+			pairs, unresolved := resolveDuplicateLivePhotoCandidates(candidates)
+			for _, pair := range pairs {
+				photo, video := pair[0], pair[1]
+				pairsByIndex[min(photo.index, video.index)] = LivePhotoPair{
+					ContentIdentifier: identifier,
+					PhotoPath:         photo.path,
+					VideoPath:         video.path,
+				}
+				consumed[photo.index] = true
+				consumed[video.index] = true
+			}
+			if len(unresolved.photos) == 0 && len(unresolved.videos) == 0 {
+				continue
+			}
+			candidates = unresolved
+		}
 		if len(candidates.photos) > 1 || len(candidates.videos) > 1 {
 			ambiguousPaths := candidatePaths(candidates)
 			code := "ambiguous-identifier"
-			message := "multiple photo or video candidates share one Live Photo identifier"
+			message := "Uploaded as separate files: these share one Live Photo ID, so they could not be paired"
 			if options.IgnoreAppleMetadata {
 				code = "ambiguous-filename-stem"
-				message = "multiple photo or video candidates share one filename stem"
+				message = "Skipped: these share one filename stem, so they could not be paired"
 				// Filename matching is an explicit override, so ambiguity must skip
 				// every candidate instead of silently falling back to single uploads.
 				for _, photo := range candidates.photos {
@@ -276,6 +300,88 @@ func metadataReadWarning(path string, err error) PreflightWarning {
 		Code:    "metadata-read-failed",
 		Message: fmt.Sprintf("could not read Live Photo metadata: %v", err),
 	}
+}
+
+// resolveDuplicateLivePhotoCandidates pairs candidates that share one
+// identifier when the copies can be told apart. A still and its video sit in
+// the same folder, so each folder is matched on its own first; within a
+// folder, or across folders when no folder pairs, the camera's HEIC wins over
+// exported copies. It returns the pairs as [photo, video] and the candidates
+// of folders that remain ambiguous. Leftover single copies are in neither and
+// upload as separate files.
+func resolveDuplicateLivePhotoCandidates(candidates *livePhotoCandidates) ([][2]indexedLivePhotoMedia, *livePhotoCandidates) {
+	byDir := make(map[string]*livePhotoCandidates)
+	var dirs []string
+	group := func(path string) *livePhotoCandidates {
+		dir := filepath.Dir(path)
+		if byDir[dir] == nil {
+			byDir[dir] = &livePhotoCandidates{}
+			dirs = append(dirs, dir)
+		}
+		return byDir[dir]
+	}
+	for _, photo := range candidates.photos {
+		g := group(photo.path)
+		g.photos = append(g.photos, photo)
+	}
+	for _, video := range candidates.videos {
+		g := group(video.path)
+		g.videos = append(g.videos, video)
+	}
+
+	pairInGroup := func(g *livePhotoCandidates) (*[2]indexedLivePhotoMedia, bool) {
+		if len(g.videos) != 1 {
+			return nil, false
+		}
+		if len(g.photos) == 1 {
+			return &[2]indexedLivePhotoMedia{g.photos[0], g.videos[0]}, true
+		}
+		if photo, ok := originalLivePhotoStill(g.photos); ok {
+			return &[2]indexedLivePhotoMedia{photo, g.videos[0]}, true
+		}
+		return nil, false
+	}
+
+	var pairs [][2]indexedLivePhotoMedia
+	unresolved := &livePhotoCandidates{}
+	for _, dir := range dirs {
+		g := byDir[dir]
+		if pair, ok := pairInGroup(g); ok {
+			pairs = append(pairs, *pair)
+			continue
+		}
+		if len(g.photos) > 1 || len(g.videos) > 1 {
+			unresolved.photos = append(unresolved.photos, g.photos...)
+			unresolved.videos = append(unresolved.videos, g.videos...)
+		}
+	}
+	if len(pairs) == 0 && len(unresolved.photos) == 0 && len(unresolved.videos) == 0 {
+		// Still and video sit in different folders: match across them.
+		if pair, ok := pairInGroup(candidates); ok {
+			return [][2]indexedLivePhotoMedia{*pair}, unresolved
+		}
+		return nil, candidates
+	}
+	return pairs, unresolved
+}
+
+// originalLivePhotoStill picks the still to pair when several photos share a
+// Live Photo identifier: the single HEIC/HEIF among them, which is what the
+// camera wrote. It fails when there is no single such photo.
+func originalLivePhotoStill(photos []indexedLivePhotoMedia) (indexedLivePhotoMedia, bool) {
+	if len(photos) < 2 {
+		return indexedLivePhotoMedia{}, false
+	}
+	var found indexedLivePhotoMedia
+	count := 0
+	for _, photo := range photos {
+		switch strings.ToLower(filepath.Ext(photo.path)) {
+		case ".heic", ".heif":
+			found = photo
+			count++
+		}
+	}
+	return found, count == 1
 }
 
 func candidatePaths(candidates *livePhotoCandidates) []string {

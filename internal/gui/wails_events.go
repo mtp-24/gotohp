@@ -29,5 +29,6 @@ func init() {
 	application.RegisterEvent[int64]("uploadCancelItem")
 	application.RegisterEvent[int64]("uploadRetryItem")
 	application.RegisterEvent[application.Void]("uploadRetryFailed")
+	application.RegisterEvent[application.Void]("uploadSkipped")
 	application.RegisterEvent[application.Void]("uploadClearFinished")
 }

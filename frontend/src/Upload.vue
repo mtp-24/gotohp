@@ -6,7 +6,7 @@ import { ScrollArea } from "./components/ui/scroll-area"
 import ThreadProgress from "./components/ThreadProgress.vue"
 import QueueItemRow from "./components/QueueItemRow.vue"
 import { uploadManager, type QueueItem, type QueueItemState } from './utils/UploadManager'
-import { X, Clock, Zap, FolderPlus, AlertTriangle, Pause, Play, RotateCcw, Trash2, WifiOff, Copy, Hourglass } from '@lucide/vue'
+import { X, Clock, Zap, FolderPlus, AlertTriangle, Pause, Play, RotateCcw, Trash2, WifiOff, Copy, Hourglass, Upload as UploadIcon } from '@lucide/vue'
 
 const { state } = uploadManager
 
@@ -141,6 +141,32 @@ const albumProgressPercent = computed(() => {
 })
 
 const hasPendingUploads = computed(() => counts.value.queued > 0 || counts.value.active > 0)
+const uploadableSkips = computed(() => state.items.filter(item => item.State === 'skipped' && item.SkipCode).length)
+
+const scanLabel = computed(() => {
+  const scan = state.queueStatus.Scan
+  if (!scan?.Phase) return ''
+  if (scan.Phase === 'checking') {
+    return `Checking Live Photos: ${scan.Checked.toLocaleString()} of ${scan.Total.toLocaleString()} files`
+  }
+  return `Scanning: ${scan.Found.toLocaleString()} files found`
+})
+const scanPercent = computed(() => {
+  const scan = state.queueStatus.Scan
+  return scan?.Phase === 'checking' && scan.Total > 0 ? Math.round((scan.Checked / scan.Total) * 100) : null
+})
+
+// One row per kind of warning, with its files, instead of one row each.
+const warningGroups = computed(() => {
+  const groups = new Map<string, { message: string; paths: string[] }>()
+  for (const warning of state.warnings) {
+    const key = `${warning.Code}\u0000${warning.Message}`
+    const group = groups.get(key) ?? { message: warning.Message, paths: [] }
+    group.paths.push(...warning.Paths)
+    groups.set(key, group)
+  }
+  return [...groups.values()]
+})
 
 // Seconds until a rate-limit pause ends.
 const rateLimitSeconds = computed(() => {
@@ -155,7 +181,8 @@ const statusLabel = computed(() => {
   if (state.queueStatus.RateLimitedUntil > 0) return `Rate limited by Google, resuming in ${formatDuration(rateLimitSeconds.value)}`
   if (state.queueStatus.Paused) return counts.value.active > 0 ? 'Pausing after current items' : 'Paused'
   if (!hasPendingUploads.value && state.isCreatingAlbum) return 'Adding to album'
-  if (!hasPendingUploads.value) return 'Scanning'
+  if (!hasPendingUploads.value && scanLabel.value) return 'Scanning'
+  if (!hasPendingUploads.value) return 'Finishing'
   return 'Uploading'
 })
 
@@ -190,6 +217,21 @@ async function copyResults() {
         />
         {{ statusLabel }}
       </p>
+    </div>
+
+    <!-- Scan progress for drops still being read -->
+    <div
+      v-if="scanLabel"
+      class="rounded-md border bg-muted/30 px-2.5 py-1.5"
+    >
+      <p class="text-xs text-muted-foreground tabular-nums">
+        {{ scanLabel }}
+      </p>
+      <Progress
+        v-if="scanPercent !== null"
+        :model-value="scanPercent"
+        class="h-1 mt-1"
+      />
     </div>
 
     <div class="flex gap-3 justify-center text-xs text-muted-foreground">
@@ -266,6 +308,17 @@ async function copyResults() {
           Retry failed ({{ counts.failed }})
         </Button>
         <Button
+          v-if="uploadableSkips > 0"
+          variant="outline"
+          size="sm"
+          class="flex-1 cursor-pointer"
+          title="Upload files skipped as incomplete Live Photos as ordinary photos and videos"
+          @click="uploadManager.uploadSkipped()"
+        >
+          <UploadIcon :size="14" />
+          Upload skipped ({{ uploadableSkips }})
+        </Button>
+        <Button
           variant="outline"
           size="sm"
           class="flex-1 cursor-pointer"
@@ -329,7 +382,7 @@ async function copyResults() {
         @click="showWarnings = !showWarnings"
       >
         <AlertTriangle :size="14" />
-        {{ state.warnings.length }} warning(s)
+        {{ warningGroups.length }} kind(s) of warning, {{ state.warnings.length }} total
         <span class="ml-auto opacity-75">{{ showWarnings ? 'Hide' : 'Show' }}</span>
       </button>
       <div
@@ -337,15 +390,15 @@ async function copyResults() {
         class="mt-1.5 max-h-32 overflow-y-auto space-y-1.5"
       >
         <div
-          v-for="(warning, index) in state.warnings"
-          :key="`${warning.Code}-${index}`"
+          v-for="(group, index) in warningGroups"
+          :key="index"
           class="rounded-md bg-amber-500/10 px-2.5 py-1.5 text-amber-700 dark:text-amber-300"
         >
           <p class="text-xs leading-snug">
-            {{ warning.Message }}
+            {{ group.message }} ({{ group.paths.length }} file(s))
           </p>
-          <p class="truncate text-[10px] opacity-75">
-            {{ warningFiles(warning.Paths) }}
+          <p class="text-[10px] opacity-75 break-words">
+            {{ warningFiles(group.paths.slice(0, 12)) }}{{ group.paths.length > 12 ? `, and ${group.paths.length - 12} more` : '' }}
           </p>
         </div>
       </div>

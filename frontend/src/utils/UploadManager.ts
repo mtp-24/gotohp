@@ -69,6 +69,8 @@ export interface QueueItem {
   State: QueueItemState;
   Message: string;
   MediaKey: string;
+  // Set on files skipped before upload, which can still be uploaded.
+  SkipCode: string;
   // Frontend-only: the run the item last joined, for per-run progress.
   runId: number;
 }
@@ -80,7 +82,17 @@ export interface QueueStatus {
   StoppedReason: string;
   // End of a pause after HTTP 429, in Unix milliseconds, or 0.
   RateLimitedUntil: number;
+  // Dropped files still being scanned; Phase is "" when none are.
+  Scan: { Phase: string; Found: number; Checked: number; Total: number };
 }
+
+const idleQueueStatus = (): QueueStatus => ({
+  Paused: false,
+  WaitingForNetwork: false,
+  StoppedReason: "",
+  RateLimitedUntil: 0,
+  Scan: { Phase: "", Found: 0, Checked: 0, Total: 0 },
+});
 
 export interface UploadState {
   isUploading: boolean;
@@ -113,7 +125,7 @@ class UploadManager {
     isUploading: false,
     items: [],
     runId: 0,
-    queueStatus: { Paused: false, WaitingForNetwork: false, StoppedReason: "", RateLimitedUntil: 0 },
+    queueStatus: idleQueueStatus(),
     totalFiles: 0,
     uploadedFiles: 0,
     threads: new Map<number, ThreadStatus>(),
@@ -177,7 +189,7 @@ class UploadManager {
         this.state.startTime = Date.now();
         this.state.uploadSpeed = 0;
         this.state.albumStatus = null;
-        this.state.queueStatus = { Paused: false, WaitingForNetwork: false, StoppedReason: "", RateLimitedUntil: 0 };
+        this.state.queueStatus = idleQueueStatus();
         this.lastSpeedUpdate = Date.now();
         this.lastBytesUploaded = 0;
         this.speedSamples = [];
@@ -362,6 +374,12 @@ class UploadManager {
 
   public retryFailed() {
     Events.Emit("uploadRetryFailed");
+  }
+
+  // Uploads files that preflight skipped, such as incomplete Live Photos, as
+  // ordinary files.
+  public uploadSkipped() {
+    Events.Emit("uploadSkipped");
   }
 
   // Drops finished items from the list, and their results, keeping anything

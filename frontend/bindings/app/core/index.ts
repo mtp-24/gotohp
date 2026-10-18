@@ -18,6 +18,7 @@ export {
     QueueItem,
     QueueItemState,
     QueueStatus,
+    ScanProgress,
     StartUploadEvent,
     ThreadStatus,
     UploadBatchStart

@@ -45,6 +45,8 @@ const detail = computed(() => {
 
 const canCancel = computed(() => props.item.State === 'queued' || props.item.State === 'active')
 const canRetry = computed(() => (props.item.State === 'failed' || props.item.State === 'cancelled') && props.item.Size > 0)
+// Files skipped before upload, e.g. incomplete Live Photos, can still go up.
+const canUploadAnyway = computed(() => props.item.State === 'skipped' && !!props.item.SkipCode)
 </script>
 
 <template>
@@ -86,6 +88,14 @@ const canRetry = computed(() => (props.item.State === 'failed' || props.item.Sta
       @click="$emit('retry')"
     >
       <RotateCcw :size="14" />
+    </button>
+    <button
+      v-else-if="canUploadAnyway"
+      class="shrink-0 rounded px-1.5 py-0.5 text-[10px] border text-muted-foreground hover:bg-muted hover:text-foreground cursor-pointer whitespace-nowrap"
+      title="Upload this file as an ordinary photo or video"
+      @click="$emit('retry')"
+    >
+      Upload anyway
     </button>
   </div>
 </template>

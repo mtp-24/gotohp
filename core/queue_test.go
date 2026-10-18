@@ -441,7 +441,7 @@ func TestScanWarnsAboutUnreadableFoldersAndSkipsJunk(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
 
-	files, warnings, err := filterGooglePhotosFilesWithWarnings([]string{dir}, UploadOptions{Recursive: true, DisableUnsupportedFilesFilter: true}, nil)
+	files, warnings, err := filterGooglePhotosFilesWithWarnings([]string{dir}, UploadOptions{Recursive: true, DisableUnsupportedFilesFilter: true}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,5 +450,127 @@ func TestScanWarnsAboutUnreadableFoldersAndSkipsJunk(t *testing.T) {
 	}
 	if len(warnings) != 1 || warnings[0].Code != "folder-unreadable" {
 		t.Fatalf("warnings = %+v", warnings)
+	}
+}
+
+func TestQueueUploadsSkippedLivePhotoFilesOnRequest(t *testing.T) {
+	m, rec, up, _ := newTestQueue(t)
+	paths := writeMedia(t, t.TempDir(), "IMG_1.JPG", "IMG_2.JPG")
+	warning := PreflightWarning{Paths: paths, Code: "incomplete-live-photo-skipped", Message: "skipped"}
+
+	// Drive one preflight by hand, as if classification had skipped both files.
+	m.mu.Lock()
+	m.startRunLocked()
+	batch := &uploadBatch{id: 1, opts: testOpts(1).normalized(), ctx: m.runCtx, scanning: true}
+	m.scans[batch] = struct{}{}
+	m.scanning++
+	m.tasks++
+	m.mu.Unlock()
+	m.addBatchItems(batch, nil, []PreflightWarning{warning}, nil)
+	m.scanFinished(batch)
+	m.taskDone()
+	rec.waitStop(t)
+
+	for _, name := range []string{"IMG_1.JPG", "IMG_2.JPG"} {
+		if item := rec.itemByName(name); item.State != QueueItemSkipped || item.SkipCode != warning.Code {
+			t.Fatalf("%s = %+v, want a skipped item with its skip code", name, item)
+		}
+	}
+
+	m.UploadSkipped()
+	for range 2 {
+		name := <-up.started
+		up.gate(name) <- nil
+	}
+	rec.waitStop(t)
+	for _, name := range []string{"IMG_1.JPG", "IMG_2.JPG"} {
+		if got := rec.itemByName(name).State; got != QueueItemDone {
+			t.Fatalf("%s state = %q, want done", name, got)
+		}
+	}
+}
+
+func TestQueueReportsScanProgress(t *testing.T) {
+	m, rec, up, _ := newTestQueue(t)
+	paths := writeMedia(t, t.TempDir(), "a.jpg")
+
+	m.Upload(paths, testOpts(1))
+	up.waitStarted(t, "a.jpg")
+	up.gate("a.jpg") <- nil
+	rec.waitStop(t)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	sawFinding, sawFound := false, false
+	for _, status := range rec.statuses {
+		sawFinding = sawFinding || status.Scan.Phase == "finding"
+		sawFound = sawFound || status.Scan.Found > 0
+	}
+	if !sawFinding || !sawFound {
+		t.Fatalf("scan progress not reported: %+v", rec.statuses)
+	}
+	if last := rec.statuses[len(rec.statuses)-1]; last.Scan.Phase != "" {
+		t.Fatalf("scan still reported after it finished: %+v", last)
+	}
+}
+
+type fakeMetadataReader struct {
+	photos map[string]string
+	videos map[string]LivePhotoMetadata
+}
+
+func (f fakeMetadataReader) PhotoContentIdentifier(path string) (string, error) {
+	if id, ok := f.photos[filepath.Base(path)]; ok {
+		return id, nil
+	}
+	return "", ErrContentIdentifierMissing
+}
+
+func (f fakeMetadataReader) VideoLivePhotoMetadata(path string) (LivePhotoMetadata, error) {
+	if metadata, ok := f.videos[filepath.Base(path)]; ok {
+		return metadata, nil
+	}
+	return LivePhotoMetadata{}, ErrContentIdentifierMissing
+}
+
+func TestClassifyPairsHEICWhenAnExportedCopySharesTheIdentifier(t *testing.T) {
+	reader := fakeMetadataReader{
+		photos: map[string]string{"IMG_0122.HEIC": "ID-1", "IMG_0122.jpeg": "ID-1"},
+		videos: map[string]LivePhotoMetadata{"IMG_0122.MOV": {ContentIdentifier: "ID-1", HasStillImageTime: true}},
+	}
+	work, warnings := ClassifyUploadWork([]string{"/p/IMG_0122.HEIC", "/p/IMG_0122.jpeg", "/p/IMG_0122.MOV"},
+		LivePhotoClassificationOptions{Enabled: true, SkipIncomplete: true}, reader)
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %+v", warnings)
+	}
+	if len(work) != 2 || work[0].Kind != UploadWorkLivePhoto || work[0].LivePhoto.PhotoPath != "/p/IMG_0122.HEIC" ||
+		work[1].Kind != UploadWorkSingle || work[1].Single.Path != "/p/IMG_0122.jpeg" {
+		t.Fatalf("work = %+v, want the HEIC paired and the JPEG on its own", work)
+	}
+}
+
+func TestClassifyPairsLivePhotoCopiesPerFolder(t *testing.T) {
+	reader := fakeMetadataReader{
+		photos: map[string]string{"IMG_0140.HEIC": "ID-2"},
+		videos: map[string]LivePhotoMetadata{"IMG_0140.MOV": {ContentIdentifier: "ID-2", HasStillImageTime: true}},
+	}
+	// The same Live Photo copied into two dropped folders.
+	paths := []string{"/a/IMG_0140.HEIC", "/a/IMG_0140.MOV", "/b/IMG_0140.HEIC", "/b/IMG_0140.MOV"}
+	work, warnings := ClassifyUploadWork(paths, LivePhotoClassificationOptions{Enabled: true, SkipIncomplete: true}, reader)
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %+v", warnings)
+	}
+	if len(work) != 2 || work[0].Kind != UploadWorkLivePhoto || work[1].Kind != UploadWorkLivePhoto ||
+		filepath.Dir(work[0].LivePhoto.PhotoPath) != filepath.Dir(work[0].LivePhoto.VideoPath) ||
+		filepath.Dir(work[1].LivePhoto.PhotoPath) != filepath.Dir(work[1].LivePhoto.VideoPath) {
+		t.Fatalf("work = %+v, want one pair per folder", work)
+	}
+
+	// Two videos in one folder stay ambiguous; their photo still uploads.
+	ambiguous := []string{"/c/IMG_0140.HEIC", "/c/IMG_0140.MOV", "/c/IMG_0140(1).MOV"}
+	reader.videos["IMG_0140(1).MOV"] = LivePhotoMetadata{ContentIdentifier: "ID-2", HasStillImageTime: true}
+	work, warnings = ClassifyUploadWork(ambiguous, LivePhotoClassificationOptions{Enabled: true, SkipIncomplete: true}, reader)
+	if len(warnings) != 1 || warnings[0].Code != "ambiguous-identifier" || len(work) != 3 {
+		t.Fatalf("work = %+v, warnings = %+v; want three separate uploads and one warning", work, warnings)
 	}
 }

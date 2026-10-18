@@ -94,6 +94,9 @@ func runGUI() {
 	wailsApp.Event.On("uploadRetryFailed", func(e *application.CustomEvent) {
 		uploadManager.RetryFailed()
 	})
+	wailsApp.Event.On("uploadSkipped", func(e *application.CustomEvent) {
+		uploadManager.UploadSkipped()
+	})
 	wailsApp.Event.On("uploadClearFinished", func(e *application.CustomEvent) {
 		uploadManager.ClearFinished()
 	})

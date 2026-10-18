@@ -29,6 +29,7 @@ declare module "@wailsio/runtime" {
             "uploadPause": boolean;
             "uploadRetryFailed": void;
             "uploadRetryItem": number;
+            "uploadSkipped": void;
             "uploadStart": core$0.UploadBatchStart;
             "uploadStop": void;
             "uploadTotalBytes": number;

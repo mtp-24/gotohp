@@ -163,13 +163,14 @@ func scanDirectoryForFiles(path string, recursive bool, excludePattern string, c
 // FilterGooglePhotosFiles expands paths into the files that would be uploaded
 // under opts: directories are scanned, unsupported files dropped, duplicates removed.
 func FilterGooglePhotosFiles(paths []string, opts UploadOptions) ([]string, error) {
-	files, _, err := filterGooglePhotosFilesWithWarnings(paths, opts, nil)
+	files, _, err := filterGooglePhotosFilesWithWarnings(paths, opts, nil, nil)
 	return files, err
 }
 
 // filterGooglePhotosFilesWithWarnings is FilterGooglePhotosFiles with
 // cancellation, also returning warnings for folders that could not be read.
-func filterGooglePhotosFilesWithWarnings(paths []string, opts UploadOptions, cancelled func() bool) ([]string, []PreflightWarning, error) {
+// found, when set, is called with the running count of selected files.
+func filterGooglePhotosFilesWithWarnings(paths []string, opts UploadOptions, cancelled func() bool, found func(int)) ([]string, []PreflightWarning, error) {
 	var supportedFiles []string
 	var warnings []PreflightWarning
 	warn := func(w PreflightWarning) { warnings = append(warnings, w) }
@@ -204,6 +205,9 @@ func filterGooglePhotosFilesWithWarnings(paths []string, opts UploadOptions, can
 			info:          info,
 		})
 		supportedFiles = append(supportedFiles, path)
+		if found != nil {
+			found(len(supportedFiles))
+		}
 	}
 
 	for _, path := range paths {
