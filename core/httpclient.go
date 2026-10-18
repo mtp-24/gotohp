@@ -22,14 +22,14 @@ func NewHTTPClientWithProxy(proxyURLStr string) (*http.Client, error) {
 	transport.MaxConnsPerHost = 10
 	transport.IdleConnTimeout = 90 * time.Second
 
-	// Configure proxy if provided
+	// Configure proxy if provided. Certificates are still verified: the proxy
+	// only tunnels the TLS connection to Google.
 	if proxyURLStr != "" {
 		proxyURL, err := url.Parse(proxyURLStr)
 		if err != nil {
 			return nil, err
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
-		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
 
 	client := &http.Client{
