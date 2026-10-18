@@ -21,6 +21,9 @@ func NewHTTPClientWithProxy(proxyURLStr string) (*http.Client, error) {
 	transport.MaxIdleConnsPerHost = 10
 	transport.MaxConnsPerHost = 10
 	transport.IdleConnTimeout = 90 * time.Second
+	// Bounds the wait for a reply once a request, including an upload body, has
+	// been fully sent, so a dropped connection cannot hang a worker forever.
+	transport.ResponseHeaderTimeout = 2 * time.Minute
 
 	// Configure proxy if provided. Certificates are still verified: the proxy
 	// only tunnels the TLS connection to Google.

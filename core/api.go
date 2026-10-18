@@ -434,15 +434,21 @@ func (a *Api) UploadFileWithProgress(ctx context.Context, filePath string, uploa
 			return ScottyFinalizeToken{}, fmt.Errorf("error opening file: %w", err)
 		}
 
-		// Wrap file in progress reader if callback provided
-		var reader io.Reader = file
-		if onProgress != nil {
-			reader = NewProgressReader(file, fileSize, func(bytesRead, total int64) {
+		reader := NewProgressReader(file, fileSize, func(bytesRead, total int64) {
+			if onProgress != nil {
 				onProgress(bytesRead, total, attemptNum)
-			})
-		}
+			}
+		})
 
-		result, err := a.doUploadRequest(ctx, uploadURL, reader)
+		// Abandon the attempt if the connection stops taking data.
+		attemptCtx, cancelAttempt := context.WithCancelCause(ctx)
+		stopWatch := watchUploadProgress(reader, fileSize, uploadStallTimeout, func() {
+			cancelAttempt(errUploadStalled)
+		})
+		result, retryable, err := a.doUploadRequest(attemptCtx, uploadURL, reader)
+		stopWatch()
+		stalled := errors.Is(context.Cause(attemptCtx), errUploadStalled)
+		cancelAttempt(nil)
 		closeErr := file.Close() // Close file after request completes (success or fail)
 		if err == nil && closeErr != nil {
 			return ScottyFinalizeToken{}, fmt.Errorf("error closing file: %w", closeErr)
@@ -452,22 +458,30 @@ func (a *Api) UploadFileWithProgress(ctx context.Context, filePath string, uploa
 			return result, nil
 		}
 
-		lastErr = err
-
 		// Don't retry on context cancellation
 		if ctx.Err() != nil {
 			return ScottyFinalizeToken{}, ctx.Err()
+		}
+		if stalled {
+			err = fmt.Errorf("%w: no progress for %s", errUploadStalled, uploadStallTimeout)
+			retryable = true
+		}
+		lastErr = err
+		if !retryable {
+			return ScottyFinalizeToken{}, fmt.Errorf("upload failed after %d attempt(s): %w", attemptNum, err)
 		}
 	}
 
 	return ScottyFinalizeToken{}, fmt.Errorf("upload failed after %d attempts: %w", retryConfig.MaxRetries+1, lastErr)
 }
 
-// doUploadRequest performs a single upload attempt
-func (a *Api) doUploadRequest(ctx context.Context, uploadURL string, reader io.Reader) (ScottyFinalizeToken, error) {
+// doUploadRequest performs a single upload attempt. retryable reports whether
+// a failed attempt is worth repeating: network errors, 5xx and 429 are; other
+// rejections are not.
+func (a *Api) doUploadRequest(ctx context.Context, uploadURL string, reader io.Reader) (token ScottyFinalizeToken, retryable bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, "PUT", uploadURL, reader)
 	if err != nil {
-		return ScottyFinalizeToken{}, fmt.Errorf("error creating request: %w", err)
+		return ScottyFinalizeToken{}, false, fmt.Errorf("error creating request: %w", err)
 	}
 
 	// Use chunked transfer encoding (don't set ContentLength)
@@ -475,7 +489,7 @@ func (a *Api) doUploadRequest(ctx context.Context, uploadURL string, reader io.R
 
 	bearerToken, err := a.BearerToken()
 	if err != nil {
-		return ScottyFinalizeToken{}, fmt.Errorf("failed to get bearer token: %w", err)
+		return ScottyFinalizeToken{}, true, fmt.Errorf("failed to get bearer token: %w", err)
 	}
 
 	req.Header.Set("Accept-Encoding", "gzip")
@@ -485,25 +499,24 @@ func (a *Api) doUploadRequest(ctx context.Context, uploadURL string, reader io.R
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return ScottyFinalizeToken{}, fmt.Errorf("request failed: %w", err)
+		return ScottyFinalizeToken{}, true, fmt.Errorf("request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Check for non-success status codes (includes retryable 5xx/429 and non-retryable 4xx)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := ReadResponseBody(resp)
-		return ScottyFinalizeToken{}, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+		return ScottyFinalizeToken{}, ShouldRetry(resp, nil), fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
 	bodyBytes, err := ReadResponseBody(resp)
 	if err != nil {
-		return ScottyFinalizeToken{}, fmt.Errorf("failed to read response body: %w", err)
+		return ScottyFinalizeToken{}, true, fmt.Errorf("failed to read response body: %w", err)
 	}
-	token, err := ParseScottyFinalizeToken(bodyBytes)
+	token, err = ParseScottyFinalizeToken(bodyBytes)
 	if err != nil {
-		return ScottyFinalizeToken{}, fmt.Errorf("invalid upload finalize response: %w", err)
+		return ScottyFinalizeToken{}, false, fmt.Errorf("invalid upload finalize response: %w", err)
 	}
-	return token, nil
+	return token, false, nil
 }
 
 // CommitUpload commits the upload to Google Photos
