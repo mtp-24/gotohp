@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/encoding/protowire"
@@ -102,7 +103,7 @@ func (f *fakeLivePhotoAPI) FindLivePhotoMotionByHash(hash []byte) (string, error
 
 func (f *fakeLivePhotoAPI) GetUploadToken(string, int64) (string, error) { return "upload", nil }
 
-func (f *fakeLivePhotoAPI) UploadFileWithProgress(context.Context, string, string, UploadProgressCallback) (ScottyFinalizeToken, error) {
+func (f *fakeLivePhotoAPI) UploadFileWithNewSessions(context.Context, string, string, func() (string, error), UploadProgressCallback) (ScottyFinalizeToken, error) {
 	f.uploads++
 	return ScottyFinalizeToken{}, nil
 }
@@ -155,4 +156,40 @@ func TestUpdateExistingPhotoToLiveSkipsWhenMotionAttached(t *testing.T) {
 			t.Fatalf("uploads=%d reconciled=%d, want the video uploaded and reconciled", api.uploads, api.reconciled)
 		}
 	})
+}
+
+// scriptedTransport answers requests in order and records their URLs.
+type scriptedTransport struct {
+	statuses []int
+	urls     []string
+}
+
+func (s *scriptedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		_, _ = io.Copy(io.Discard, req.Body)
+	}
+	s.urls = append(s.urls, req.URL.String())
+	status := s.statuses[0]
+	s.statuses = s.statuses[1:]
+	return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+}
+
+func TestUploadRetryStartsNewSession(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.jpg")
+	if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	transport := &scriptedTransport{statuses: []int{http.StatusServiceUnavailable, http.StatusBadRequest}}
+	api := &Api{
+		client:            &http.Client{Transport: transport},
+		authResponseCache: map[string]string{"Expiry": "9999999999", "Auth": "token"},
+	}
+	_, err := api.UploadFileWithNewSessions(context.Background(), path, "first", func() (string, error) { return "second", nil }, nil)
+	if err == nil {
+		t.Fatal("expected the 400 to end the upload")
+	}
+	if len(transport.urls) != 2 ||
+		!strings.HasSuffix(transport.urls[0], "upload_id=first") || !strings.HasSuffix(transport.urls[1], "upload_id=second") {
+		t.Fatalf("urls = %v, want a new session on the retry", transport.urls)
+	}
 }

@@ -419,7 +419,20 @@ func (a *Api) UploadFile(ctx context.Context, filePath string, uploadToken strin
 	return a.UploadFileWithProgress(ctx, filePath, uploadToken, nil)
 }
 
+// UploadFileWithProgress uploads a file to the session uploadToken, retrying
+// the same session on transient failures.
 func (a *Api) UploadFileWithProgress(ctx context.Context, filePath string, uploadToken string, onProgress UploadProgressCallback) (ScottyFinalizeToken, error) {
+	return a.uploadFile(ctx, filePath, uploadToken, nil, onProgress)
+}
+
+// UploadFileWithNewSessions is UploadFileWithProgress, but each retry starts
+// a new upload session from newToken: a session that failed partway through
+// may not accept the file again from the start.
+func (a *Api) UploadFileWithNewSessions(ctx context.Context, filePath string, uploadToken string, newToken func() (string, error), onProgress UploadProgressCallback) (ScottyFinalizeToken, error) {
+	return a.uploadFile(ctx, filePath, uploadToken, newToken, onProgress)
+}
+
+func (a *Api) uploadFile(ctx context.Context, filePath string, uploadToken string, newToken func() (string, error), onProgress UploadProgressCallback) (ScottyFinalizeToken, error) {
 	// Get file size first (needed for progress tracking)
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
@@ -427,7 +440,8 @@ func (a *Api) UploadFileWithProgress(ctx context.Context, filePath string, uploa
 	}
 	fileSize := fileInfo.Size()
 
-	uploadURL := "https://photos.googleapis.com/data/upload/uploadmedia/interactive?upload_id=" + uploadToken
+	const uploadURLPrefix = "https://photos.googleapis.com/data/upload/uploadmedia/interactive?upload_id="
+	uploadURL := uploadURLPrefix + uploadToken
 	retryConfig := DefaultRetryConfig()
 
 	var lastErr error
@@ -446,6 +460,14 @@ func (a *Api) UploadFileWithProgress(ctx context.Context, filePath string, uploa
 			case <-ctx.Done():
 				return ScottyFinalizeToken{}, ctx.Err()
 			case <-time.After(delay):
+			}
+			if newToken != nil {
+				token, err := newToken()
+				if err != nil {
+					lastErr = fmt.Errorf("error starting a new upload session: %w", err)
+					continue
+				}
+				uploadURL = uploadURLPrefix + token
 			}
 		}
 

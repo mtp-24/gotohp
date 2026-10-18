@@ -374,7 +374,8 @@ func uploadSingleFile(ctx context.Context, api *Api, filePath string, opts Uploa
 		})
 	}
 
-	finalizeToken, err := api.UploadFileWithProgress(ctx, filePath, token, progressCallback)
+	newToken := func() (string, error) { return api.GetUploadToken(sha1_hash_b64, fileSize) }
+	finalizeToken, err := api.UploadFileWithNewSessions(ctx, filePath, token, newToken, progressCallback)
 	if err != nil {
 		return "", false, fmt.Errorf("error uploading file: %w", err)
 	}

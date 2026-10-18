@@ -12,7 +12,7 @@ type livePhotoUploadAPI interface {
 	FindRemoteMediaByHash(hash []byte) (string, error)
 	FindLivePhotoMotionByHash(hash []byte) (string, error)
 	GetUploadToken(sha1Hash string, fileSize int64) (string, error)
-	UploadFileWithProgress(ctx context.Context, filePath string, uploadToken string, onProgress UploadProgressCallback) (ScottyFinalizeToken, error)
+	UploadFileWithNewSessions(ctx context.Context, filePath string, uploadToken string, newToken func() (string, error), onProgress UploadProgressCallback) (ScottyFinalizeToken, error)
 	CommitLivePhoto(input LivePhotoCreateRequest) (string, error)
 	ReconcileLivePhoto(input LivePhotoReconcileRequest) (string, error)
 }
@@ -271,7 +271,8 @@ func uploadLivePhotoComponent(
 	displayName string,
 	reporter UploadReporter,
 ) (ScottyFinalizeToken, error) {
-	uploadSession, err := api.GetUploadToken(base64.StdEncoding.EncodeToString(hash), size)
+	hashB64 := base64.StdEncoding.EncodeToString(hash)
+	uploadSession, err := api.GetUploadToken(hashB64, size)
 	if err != nil {
 		return ScottyFinalizeToken{}, err
 	}
@@ -291,7 +292,8 @@ func uploadLivePhotoComponent(
 			Attempt:       attempt,
 		})
 	}
-	return api.UploadFileWithProgress(ctx, componentPath, uploadSession, progress)
+	newToken := func() (string, error) { return api.GetUploadToken(hashB64, size) }
+	return api.UploadFileWithNewSessions(ctx, componentPath, uploadSession, newToken, progress)
 }
 
 func removeLivePhotoFiles(pair LivePhotoPair) error {
