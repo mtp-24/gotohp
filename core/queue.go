@@ -161,8 +161,10 @@ type UploadManager struct {
 	pending     []*queueEntry
 	inQueue     map[string]*queueEntry
 	workerSlots []bool
-	scans       map[*uploadBatch]struct{}
-	lastScanAt  time.Time
+	// itemPaths counts known items per file path, for HasItemPath.
+	itemPaths  map[string]int
+	scans      map[*uploadBatch]struct{}
+	lastScanAt time.Time
 
 	albumMu   sync.Mutex
 	albumKeys map[string]string
@@ -192,6 +194,7 @@ func NewUploadManager(reporter UploadReporter, logger *slog.Logger) *UploadManag
 		logger:        logger,
 		items:         make(map[int64]*queueEntry),
 		inQueue:       make(map[string]*queueEntry),
+		itemPaths:     make(map[string]int),
 		scans:         make(map[*uploadBatch]struct{}),
 		albumKeys:     make(map[string]string),
 		probe:         probeGooglePhotos,
@@ -440,8 +443,21 @@ func (m *UploadManager) ClearFinished() {
 	for id, entry := range m.items {
 		if entry.item.State.finished() {
 			delete(m.items, id)
+			for _, path := range entry.item.Paths {
+				if m.itemPaths[path]--; m.itemPaths[path] <= 0 {
+					delete(m.itemPaths, path)
+				}
+			}
 		}
 	}
+}
+
+// HasItemPath reports whether path is a file of a known queue item. It lets
+// the app serve previews of queued files and nothing else.
+func (m *UploadManager) HasItemPath(path string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.itemPaths[path] > 0
 }
 
 // Items returns a snapshot of every known item in queue order.
@@ -707,6 +723,9 @@ func (m *UploadManager) newEntryLocked(batch *uploadBatch, work UploadWorkItem, 
 		batch: batch,
 	}
 	m.items[entry.item.ID] = entry
+	for _, path := range entry.item.Paths {
+		m.itemPaths[path]++
+	}
 	return entry
 }
 

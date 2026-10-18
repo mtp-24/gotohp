@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import type { QueueItem, ThreadStatus } from '../utils/UploadManager'
-import { RotateCcw, X } from '@lucide/vue'
+import { Film, Image as ImageIcon, RotateCcw, X } from '@lucide/vue'
 
 const props = defineProps<{
   item: QueueItem
@@ -43,6 +43,14 @@ const detail = computed(() => {
   return props.item.Message
 })
 
+// A small preview made by the backend from the local file. It loads only when
+// the row is on screen; on failure, or on platforms without a thumbnailer, a
+// file-type icon shows instead.
+const thumbnailFailed = ref(false)
+watch(() => props.item.Path, () => { thumbnailFailed.value = false })
+const thumbnailUrl = computed(() => props.item.Path ? `/thumbnail?path=${encodeURIComponent(props.item.Path)}` : '')
+const isVideo = computed(() => /\.(mov|mp4|m4v|3gp|avi|mkv|webm|mts|m2ts|wmv|mpg|mpeg)$/i.test(props.item.Path))
+
 const canCancel = computed(() => props.item.State === 'queued' || props.item.State === 'active')
 const canRetry = computed(() => (props.item.State === 'failed' || props.item.State === 'cancelled') && props.item.Size > 0)
 // Files skipped before upload, e.g. incomplete Live Photos, can still go up.
@@ -51,6 +59,29 @@ const canUploadAnyway = computed(() => props.item.State === 'skipped' && !!props
 
 <template>
   <div class="group flex items-start gap-2 rounded-md border bg-card px-2.5 py-1.5">
+    <div class="size-8 shrink-0 overflow-hidden rounded bg-muted flex items-center justify-center">
+      <img
+        v-if="thumbnailUrl && !thumbnailFailed"
+        :src="thumbnailUrl"
+        loading="lazy"
+        decoding="async"
+        width="32"
+        height="32"
+        alt=""
+        class="size-full object-cover"
+        @error="thumbnailFailed = true"
+      >
+      <Film
+        v-else-if="isVideo"
+        :size="14"
+        class="text-muted-foreground"
+      />
+      <ImageIcon
+        v-else
+        :size="14"
+        class="text-muted-foreground"
+      />
+    </div>
     <span
       :class="['mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium', stateConfig.color, stateConfig.bg]"
     >

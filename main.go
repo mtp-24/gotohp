@@ -6,12 +6,14 @@ import (
 	"embed"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 
 	"app/core"
 	"app/internal/cli"
 	"app/internal/gui"
+	"app/internal/thumbnail"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
@@ -39,6 +41,11 @@ func runGUI() {
 	normalizeFrontendDevServerURL()
 
 	configManager := &core.ConfigManager{}
+	// Set once the app exists; thumbnails are only served for queued files.
+	var uploadManager *core.UploadManager
+	thumbnails := thumbnail.NewServer(func(path string) bool {
+		return uploadManager != nil && uploadManager.HasItemPath(path)
+	})
 	wailsApp := application.New(application.Options{
 		Name:        "com.xob0t.gotohp",
 		Description: "Google Photos unofficial client",
@@ -47,6 +54,15 @@ func runGUI() {
 		},
 		Assets: application.AssetOptions{
 			Handler: application.BundledAssetFileServer(assets),
+			Middleware: func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/thumbnail" {
+						thumbnails.ServeHTTP(w, r)
+						return
+					}
+					next.ServeHTTP(w, r)
+				})
+			},
 		},
 		Mac: application.MacOptions{
 			ApplicationShouldTerminateAfterLastWindowClosed: true,
@@ -70,7 +86,7 @@ func runGUI() {
 		URL: "/",
 	})
 
-	uploadManager := core.NewUploadManager(gui.NewWailsReporter(wailsApp), wailsApp.Logger)
+	uploadManager = core.NewUploadManager(gui.NewWailsReporter(wailsApp), wailsApp.Logger)
 
 	// Queue controls from the frontend
 	wailsApp.Event.On("uploadCancel", func(e *application.CustomEvent) {

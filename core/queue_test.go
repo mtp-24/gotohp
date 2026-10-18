@@ -730,3 +730,22 @@ func TestClassifyMatchesTakeoutCopiesByEncoding(t *testing.T) {
 		t.Fatalf("same encoding: pairs = %v, items = %d, warnings = %+v; want all skipped", pairs, n, warnings)
 	}
 }
+
+func TestHasItemPathTracksQueuedFilesOnly(t *testing.T) {
+	m, rec, up, _ := newTestQueue(t)
+	paths := writeMedia(t, t.TempDir(), "a.jpg")
+	if m.HasItemPath(paths[0]) {
+		t.Fatal("path known before it was queued")
+	}
+	m.Upload(paths, testOpts(1))
+	up.waitStarted(t, "a.jpg")
+	if !m.HasItemPath(paths[0]) || m.HasItemPath("/etc/passwd") {
+		t.Fatal("HasItemPath must accept queued files and nothing else")
+	}
+	up.gate("a.jpg") <- nil
+	rec.waitStop(t)
+	m.ClearFinished()
+	if m.HasItemPath(paths[0]) {
+		t.Fatal("path still known after the list was cleared")
+	}
+}
