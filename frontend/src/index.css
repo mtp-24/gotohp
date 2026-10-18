@@ -196,12 +196,13 @@
 }
 
 /* Drop zone styles - activated by Wails runtime when dragging over */
-.drop-zone.file-drop-target-active {
+/* Wails marks the drop target (the zone's wrapper) as active. */
+.file-drop-target-active > .drop-zone {
   border-color: oklch(0.696 0.17 162.48) !important;
   background-color: oklch(0.696 0.17 162.48 / 10%);
 }
 
-.drop-zone.file-drop-target-active h2,
-.drop-zone.file-drop-target-active p {
+.file-drop-target-active > .drop-zone h2,
+.file-drop-target-active > .drop-zone p {
   color: oklch(0.985 0 0) !important;
 }

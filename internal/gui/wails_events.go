@@ -20,6 +20,7 @@ func init() {
 	application.RegisterEvent[int64]("uploadTotalBytes")
 	application.RegisterEvent[int64]("uploadTotalBytesDelta")
 	application.RegisterEvent[core.FilesDroppedEvent]("files-dropped")
+	application.RegisterEvent[bool]("files-drag")
 	application.RegisterEvent[core.StartUploadEvent]("startUpload")
 	application.RegisterEvent[[]core.QueueItem]("queueItems")
 	application.RegisterEvent[core.QueueItem]("queueItemUpdate")

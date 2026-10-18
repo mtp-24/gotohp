@@ -98,6 +98,20 @@ func runGUI() {
 		uploadManager.ClearFinished()
 	})
 
+	// On macOS a native view receives file drags, so the page gets no reliable
+	// DOM drag events. Forward the native ones so the drop zones still show.
+	// The "performed" event only schedules hiding: the drop target is read
+	// from the page after it, so the zones must stay up until then.
+	window.OnWindowEvent(events.Mac.WindowFileDraggingEntered, func(*application.WindowEvent) {
+		wailsApp.Event.Emit("files-drag", true)
+	})
+	window.OnWindowEvent(events.Mac.WindowFileDraggingExited, func(*application.WindowEvent) {
+		wailsApp.Event.Emit("files-drag", false)
+	})
+	window.OnWindowEvent(events.Mac.WindowFileDraggingPerformed, func(*application.WindowEvent) {
+		wailsApp.Event.Emit("files-drag", false)
+	})
+
 	window.OnWindowEvent(events.Common.WindowFilesDropped, func(event *application.WindowEvent) {
 		paths := event.Context().DroppedFiles()
 		dropTarget := event.Context().DropTargetDetails()

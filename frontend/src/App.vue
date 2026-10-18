@@ -141,8 +141,33 @@ onMounted(async () => {
 
 
 
+const dropZones = [
+  { id: 'regular', title: 'Upload Only', description: 'Upload files without adding to any album' },
+  { id: 'album', title: 'Upload to Album', description: "Upload and add to a specific album (you'll enter the name)" },
+  { id: 'auto-album', title: 'Auto Album', description: 'Upload and create one album per folder, named after the folder' },
+]
+
 // Global drag event handlers to detect file dragging
 let dragLeaveTimeout: ReturnType<typeof setTimeout> | null = null
+let nativeDragActive = false
+
+// Native drag state from the backend (macOS). Hiding is delayed so the drop
+// target under the cursor can still be read after the drop.
+const onNativeDrag = (dragging: boolean) => {
+  nativeDragActive = dragging
+  if (dragLeaveTimeout) {
+    clearTimeout(dragLeaveTimeout)
+    dragLeaveTimeout = null
+  }
+  if (dragging) {
+    isDraggingFiles.value = true
+    return
+  }
+  dragLeaveTimeout = setTimeout(() => {
+    isDraggingFiles.value = false
+    dragLeaveTimeout = null
+  }, 300)
+}
 
 const onDragEnter = (e: DragEvent) => {
   if (!e.dataTransfer?.types.includes('Files')) return
@@ -169,6 +194,9 @@ const onDragOver = (e: DragEvent) => {
 
 const onDragLeave = (e: DragEvent) => {
   if (!e.dataTransfer?.types.includes('Files')) return
+  // While a native (macOS) drag is in progress the page can see a spurious
+  // dragleave; the native exit event hides the zones instead.
+  if (nativeDragActive) return
   
   // Use timeout to detect if we've truly left the window
   // dragover will cancel this if we're still in the window
@@ -281,9 +309,13 @@ onMounted(() => {
   window.addEventListener('albumError', albumErrorHandler)
   window.addEventListener('uploadError', uploadErrorHandler)
 
+  Events.On('files-drag', (event: { data: boolean }) => onNativeDrag(event.data))
+
   // Listen for files-dropped event from backend
   Events.On('files-dropped', async (event: { data: { files: string[]; dropZone: string } }) => {
     const { files, dropZone } = event.data
+    nativeDragActive = false
+    isDraggingFiles.value = false
 
     if (dropZone === 'album') {
       // Show album input screen
@@ -317,53 +349,35 @@ onUnmounted(() => {
     class="relative w-screen h-screen flex flex-col items-center"
     style="--wails-draggable: drag"
   >
-    <!-- Drop zones, shown over any view while files are dragged in -->
+    <!-- Drop zones, shown over any view while files are dragged in. The zones
+         tile the whole window with no gaps: a drop outside every target is
+         silently ignored by Wails. -->
     <div
       v-if="isDraggingFiles && options.length > 0"
-      class="absolute inset-0 z-40 flex flex-col gap-3 p-6 bg-background/95"
+      class="absolute inset-0 z-40 flex flex-col bg-background"
       style="--wails-draggable: none"
     >
       <p
         v-if="showQueue"
-        class="text-center text-xs text-muted-foreground select-none"
+        class="pointer-events-none absolute top-2 inset-x-0 text-center text-xs text-muted-foreground select-none"
       >
         Files dropped now join the current queue
       </p>
       <div
+        v-for="(zone, index) in dropZones"
+        :key="zone.id"
         data-file-drop-target
-        data-drop-zone="regular"
-        class="flex-1 flex flex-col items-center justify-center border-2 border-dashed border-muted-foreground/50 rounded-xl transition-all duration-200 drop-zone"
+        :data-drop-zone="zone.id"
+        :class="['flex-1 flex px-4 py-1.5', index === 0 && 'pt-8', index === dropZones.length - 1 && 'pb-4']"
       >
-        <h2 class="text-xl font-semibold select-none text-muted-foreground">
-          Upload Only
-        </h2>
-        <p class="text-sm text-muted-foreground/70 mt-2 select-none text-center px-4">
-          Upload files without adding to any album
-        </p>
-      </div>
-      <div
-        data-file-drop-target
-        data-drop-zone="album"
-        class="flex-1 flex flex-col items-center justify-center border-2 border-dashed border-muted-foreground/50 rounded-xl transition-all duration-200 drop-zone"
-      >
-        <h2 class="text-xl font-semibold select-none text-muted-foreground">
-          Upload to Album
-        </h2>
-        <p class="text-sm text-muted-foreground/70 mt-2 select-none text-center px-4">
-          Upload and add to a specific album (you'll enter the name)
-        </p>
-      </div>
-      <div
-        data-file-drop-target
-        data-drop-zone="auto-album"
-        class="flex-1 flex flex-col items-center justify-center border-2 border-dashed border-muted-foreground/50 rounded-xl transition-all duration-200 drop-zone"
-      >
-        <h2 class="text-xl font-semibold select-none text-muted-foreground">
-          Auto Album
-        </h2>
-        <p class="text-sm text-muted-foreground/70 mt-2 select-none text-center px-4">
-          Upload and create albums automatically based on folder names
-        </p>
+        <div class="drop-zone flex-1 flex flex-col items-center justify-center border-2 border-dashed border-muted-foreground/50 rounded-xl transition-all duration-200">
+          <h2 class="text-xl font-semibold select-none text-muted-foreground">
+            {{ zone.title }}
+          </h2>
+          <p class="text-sm text-muted-foreground/70 mt-2 select-none text-center px-4">
+            {{ zone.description }}
+          </p>
+        </div>
       </div>
     </div>
 

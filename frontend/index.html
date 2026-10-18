@@ -5,6 +5,35 @@
     <link rel="icon" type="image/svg+xml" href="/wails.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Wails + Vue + TS</title>
+    <script>
+      // Wails starts a native window drag when it sees the primary button held
+      // over a `--wails-draggable: drag` region, even when the press happened
+      // outside the page. After a file drop on macOS, WebKit can keep
+      // reporting the button as held, so the window would follow the cursor.
+      // This runs before the Wails runtime registers its listeners and hides
+      // held-button moves whose press did not start inside the window.
+      (function () {
+        var pressedInside = false;
+        var reset = function () { pressedInside = false; };
+        window.addEventListener("mousedown", function (e) {
+          if (e.button === 0) pressedInside = true;
+        }, true);
+        window.addEventListener("mouseup", function (e) {
+          if (e.button === 0) pressedInside = false;
+        }, true);
+        window.addEventListener("mousemove", function (e) {
+          if (!(e.buttons & 1)) {
+            pressedInside = false;
+          } else if (!pressedInside) {
+            e.stopImmediatePropagation();
+          }
+        }, true);
+        window.addEventListener("blur", reset, true);
+        window.addEventListener("drop", reset, true);
+        window.addEventListener("dragend", reset, true);
+        document.addEventListener("mouseleave", reset, true);
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>
