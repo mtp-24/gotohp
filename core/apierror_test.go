@@ -95,8 +95,10 @@ func TestAuthErrorLineIsCredentialRejection(t *testing.T) {
 		_, _ = fmt.Fprint(w, "Error=BadAuthentication\n")
 	}))
 	defer server.Close()
-	api := &Api{client: server.Client(), authData: "Email=a%40example.com", authEndpoint: server.URL,
-		authResponseCache: map[string]string{"Expiry": "0", "Auth": ""}}
+	api := &Api{
+		client: server.Client(), authData: "Email=a%40example.com", authEndpoint: server.URL,
+		authResponseCache: map[string]string{"Expiry": "0", "Auth": ""},
+	}
 
 	_, err := api.BearerToken()
 	apiErr, ok := asAPIError(err)
