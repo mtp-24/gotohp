@@ -21,4 +21,12 @@ func init() {
 	application.RegisterEvent[int64]("uploadTotalBytesDelta")
 	application.RegisterEvent[core.FilesDroppedEvent]("files-dropped")
 	application.RegisterEvent[core.StartUploadEvent]("startUpload")
+	application.RegisterEvent[[]core.QueueItem]("queueItems")
+	application.RegisterEvent[core.QueueItem]("queueItemUpdate")
+	application.RegisterEvent[core.QueueStatus]("queueStatus")
+	application.RegisterEvent[bool]("uploadPause")
+	application.RegisterEvent[int64]("uploadCancelItem")
+	application.RegisterEvent[int64]("uploadRetryItem")
+	application.RegisterEvent[application.Void]("uploadRetryFailed")
+	application.RegisterEvent[application.Void]("uploadClearFinished")
 }

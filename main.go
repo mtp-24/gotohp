@@ -54,14 +54,14 @@ func runGUI() {
 	})
 
 	window := wailsApp.Window.NewWithOptions(application.WebviewWindowOptions{
-		Title:               title,
-		Frameless:           false,
-		Width:               400,
-		Height:              600,
-		EnableFileDrop:      true,
-		DisableResize:       true,
-		MaximiseButtonState: application.ButtonDisabled,
-		BackgroundType:      application.BackgroundTypeTranslucent,
+		Title:          title,
+		Frameless:      false,
+		Width:          420,
+		Height:         640,
+		MinWidth:       380,
+		MinHeight:      520,
+		EnableFileDrop: true,
+		BackgroundType: application.BackgroundTypeTranslucent,
 		Mac: application.MacWindow{
 			InvisibleTitleBarHeight: 0,
 			Backdrop:                application.MacBackdropTranslucent,
@@ -72,9 +72,30 @@ func runGUI() {
 
 	uploadManager := core.NewUploadManager(gui.NewWailsReporter(wailsApp), wailsApp.Logger)
 
-	// Listen for upload cancel event
+	// Queue controls from the frontend
 	wailsApp.Event.On("uploadCancel", func(e *application.CustomEvent) {
 		uploadManager.Cancel()
+	})
+	wailsApp.Event.On("uploadPause", func(e *application.CustomEvent) {
+		if paused, ok := e.Data.(bool); ok {
+			uploadManager.SetPaused(paused)
+		}
+	})
+	wailsApp.Event.On("uploadCancelItem", func(e *application.CustomEvent) {
+		if id, ok := e.Data.(int64); ok {
+			uploadManager.CancelItem(id)
+		}
+	})
+	wailsApp.Event.On("uploadRetryItem", func(e *application.CustomEvent) {
+		if id, ok := e.Data.(int64); ok {
+			uploadManager.RetryItem(id)
+		}
+	})
+	wailsApp.Event.On("uploadRetryFailed", func(e *application.CustomEvent) {
+		uploadManager.RetryFailed()
+	})
+	wailsApp.Event.On("uploadClearFinished", func(e *application.CustomEvent) {
+		uploadManager.ClearFinished()
 	})
 
 	window.OnWindowEvent(events.Common.WindowFilesDropped, func(event *application.WindowEvent) {
@@ -96,11 +117,15 @@ func runGUI() {
 		})
 	})
 
-	// Listen for upload request from frontend (after drop zone is determined)
+	// Listen for upload requests from the frontend (after the drop zone is
+	// chosen). Files dropped during a run join the existing queue.
 	wailsApp.Event.On("startUpload", func(e *application.CustomEvent) {
 		if data, ok := e.Data.(core.StartUploadEvent); ok {
-			wailsApp.Logger.Info("Starting upload", "fileCount", len(data.Files))
-			uploadManager.Upload(data.Files, configManager.SessionUploadOptions())
+			wailsApp.Logger.Info("Queueing upload", "fileCount", len(data.Files))
+			opts := configManager.SessionUploadOptions()
+			opts.AlbumName = strings.TrimSpace(data.AlbumName)
+			opts.AlbumAutoMode = data.AlbumAutoMode
+			uploadManager.Upload(data.Files, opts)
 		} else {
 			wailsApp.Logger.Error("startUpload: unexpected data type", "type", fmt.Sprintf("%T", e.Data))
 		}

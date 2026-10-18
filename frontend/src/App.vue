@@ -8,7 +8,7 @@ import {
   SheetTrigger,
 } from '@/components/ui/sheet'
 import { useColorMode } from '@vueuse/core'
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { UserPlus } from '@lucide/vue'
 import { ConfigManager } from '../bindings/app/core'
 import { Events } from '@wailsio/runtime'
@@ -26,13 +26,14 @@ import { toast } from "vue-sonner"
 useColorMode().value = "dark"
 
 const { state: uploadState } = uploadManager
-const copyButtonText = ref('Copy as JSON');
 
 // Drag state for dual drop zones
 const isDraggingFiles = ref(false)
 
 // Album upload flow state
 const showAlbumInput = ref(false)
+// The upload list stays up after a run until the user clears it.
+const showQueue = computed(() => uploadState.isUploading || uploadState.items.length > 0)
 const pendingFiles = ref<string[]>([])
 const pendingFileCount = ref(0)
 
@@ -138,12 +139,6 @@ onMounted(async () => {
 
 })
 
-const handleCopyClick = () => {
-  uploadManager.copyResultsAsJson();
-  copyButtonText.value = 'Copied!';
-  setTimeout(() => copyButtonText.value = 'Copy as JSON', 1000);
-};
-
 
 
 // Global drag event handlers to detect file dragging
@@ -200,13 +195,22 @@ const onDrop = () => {
   }, 100)
 }
 
+// Queue files; the album choice travels with this drop only.
+const queueFiles = async (files: string[], albumName: string, albumAutoMode: boolean) => {
+  try {
+    await Events.Emit('startUpload', { files, albumName, albumAutoMode })
+  } catch (error) {
+    console.error('Failed to start upload:', error)
+    toast.error('Failed to start upload', {
+      description: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
 // Album upload confirmation
 const confirmAlbumUpload = async () => {
-  // Set album name in backend (not persisted to disk)
-  await ConfigManager.SetAlbumName(albumNameOrKey.value)
-  await ConfigManager.SetAlbumAutoMode(false)
-  // Start upload with pending files
-  Events.Emit('startUpload', { files: pendingFiles.value })
+  if (!albumNameOrKey.value.trim()) return
+  await queueFiles(pendingFiles.value, albumNameOrKey.value.trim(), false)
   showAlbumInput.value = false
   pendingFiles.value = []
   pendingFileCount.value = 0
@@ -236,15 +240,37 @@ const albumErrorHandler = (e: Event) => {
   }
 }
 
+// Show the first failure right away, then fold any that follow within a few
+// seconds into one summary toast so a batch-wide failure cannot flood the screen.
+const errorToastWindowMs = 4000
+let suppressedErrors = 0
+let errorWindowTimer: ReturnType<typeof setTimeout> | null = null
+
 const uploadErrorHandler = (e: Event) => {
   const event = e as CustomEvent<{ FileName: string; Message: string }>
   const { FileName, Message } = event.detail
-  const errorMessage = Message.replace(/^Error:\s*/, '')
+  if (errorWindowTimer) {
+    suppressedErrors++
+    return
+  }
   toast.error(FileName ? `Upload failed: ${FileName}` : 'Upload failed', {
-    description: errorMessage,
+    description: Message.replace(/^Error:\s*/, ''),
     duration: 10000,
     important: true,
   })
+  const flush = () => {
+    if (suppressedErrors > 0) {
+      toast.error(`${suppressedErrors} more upload(s) failed`, {
+        description: 'See the Failed filter in the upload list.',
+        duration: 10000,
+      })
+      suppressedErrors = 0
+      errorWindowTimer = setTimeout(flush, errorToastWindowMs)
+    } else {
+      errorWindowTimer = null
+    }
+  }
+  errorWindowTimer = setTimeout(flush, errorToastWindowMs)
 }
 
 onMounted(() => {
@@ -265,16 +291,7 @@ onMounted(() => {
       pendingFileCount.value = files.length
       showAlbumInput.value = true
     } else {
-      try {
-        await ConfigManager.SetAlbumName('')
-        await ConfigManager.SetAlbumAutoMode(dropZone === 'auto-album')
-        await Events.Emit('startUpload', { files })
-      } catch (error) {
-        console.error('Failed to start upload:', error)
-        toast.error('Failed to start upload', {
-          description: error instanceof Error ? error.message : String(error),
-        })
-      }
+      await queueFiles(files, '', dropZone === 'auto-album')
     }
   })
 })
@@ -289,20 +306,29 @@ onUnmounted(() => {
   if (dragLeaveTimeout) {
     clearTimeout(dragLeaveTimeout)
   }
+  if (errorWindowTimer) {
+    clearTimeout(errorWindowTimer)
+  }
 })
 </script>
 
 <template>
   <main
-    class="w-screen h-screen flex flex-col items-center"
+    class="relative w-screen h-screen flex flex-col items-center"
     style="--wails-draggable: drag"
   >
-    <!-- Drop zones shown when dragging files -->
+    <!-- Drop zones, shown over any view while files are dragged in -->
     <div
-      v-if="!uploadState.isUploading && isDraggingFiles && options.length > 0"
-      class="w-screen h-screen flex flex-col gap-3 p-6"
+      v-if="isDraggingFiles && options.length > 0"
+      class="absolute inset-0 z-40 flex flex-col gap-3 p-6 bg-background/95"
       style="--wails-draggable: none"
     >
+      <p
+        v-if="showQueue"
+        class="text-center text-xs text-muted-foreground select-none"
+      >
+        Files dropped now join the current queue
+      </p>
       <div
         data-file-drop-target
         data-drop-zone="regular"
@@ -341,9 +367,68 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- Normal UI (not dragging) -->
+    <!-- Album name prompt for files dropped on the album zone -->
     <div
-      v-else-if="!uploadState.isUploading"
+      v-if="showAlbumInput"
+      class="absolute inset-0 z-30 flex flex-col items-center justify-center gap-6 p-8 bg-background"
+      style="--wails-draggable: none"
+    >
+      <h1 class="text-xl font-semibold select-none">
+        Upload to Album
+      </h1>
+      <p class="text-muted-foreground select-none">
+        {{ pendingFileCount }} file(s) ready to upload
+      </p>
+
+      <form
+        class="flex flex-col gap-2 w-full max-w-xs"
+        @submit.prevent="confirmAlbumUpload"
+      >
+        <Label
+          for="album-input"
+          class="text-muted-foreground text-sm"
+        >Album name or key</Label>
+        <Input
+          id="album-input"
+          v-model="albumNameOrKey"
+          placeholder="Album name or AF1Qip... key"
+          autofocus
+        />
+        <p class="text-[11px] text-muted-foreground">
+          Using the same name again this session adds to the same album.
+        </p>
+        <div class="flex gap-4 justify-center mt-4">
+          <Button
+            type="button"
+            variant="outline"
+            class="cursor-pointer select-none"
+            @click="cancelAlbumUpload"
+          >
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            class="cursor-pointer select-none"
+            :disabled="!albumNameOrKey.trim()"
+          >
+            Upload
+          </Button>
+        </div>
+      </form>
+    </div>
+
+    <!-- Upload queue -->
+    <div
+      v-if="showQueue"
+      class="w-full h-full"
+      data-file-drop-target
+    >
+      <Upload />
+    </div>
+
+    <!-- Home -->
+    <div
+      v-else
       class="w-screen h-screen flex flex-col items-center gap-4 max-w-md px-6 pt-30"
       data-file-drop-target
     >
@@ -370,123 +455,49 @@ onUnmounted(() => {
       </template>
 
       <template v-else>
-        <!-- Show album input screen when files dropped on album zone -->
-        <template v-if="showAlbumInput">
-          <div
-            class="flex flex-col items-center justify-center gap-6 p-8"
-            style="--wails-draggable: none"
+        <h1 class="text-xl font-semibold select-none">
+          Drop files to upload
+        </h1>
+        <GoogleAccountSelect
+          v-model="selectedOption"
+          :options="options"
+          :removing-account="removingAccount"
+          @item-removed="removeCredentials"
+          @add="openAccountSetup"
+        />
+        <div
+          v-if="tokenBindingEmail"
+          class="w-full max-w-xs border rounded-lg p-3 flex flex-col gap-3"
+          style="--wails-draggable: none"
+        >
+          <p class="text-sm text-muted-foreground">
+            This credential needs a token binding key from the rooted Android device it was captured from.
+          </p>
+          <Button
+            class="cursor-pointer select-none"
+            :disabled="isExtractingTokenBinding"
+            @click="addTokenBindingAliasFromADB"
           >
-            <h1 class="text-xl font-semibold select-none">
-              Upload to Album
-            </h1>
-            <p class="text-muted-foreground select-none">
-              {{ pendingFileCount }} file(s) ready to upload
-            </p>
-            
-            <div class="flex flex-col gap-2 w-full max-w-xs">
-              <Label
-                for="album-input"
-                class="text-muted-foreground text-sm"
-              >Album name or key</Label>
-              <Input
-                id="album-input"
-                v-model="albumNameOrKey"
-                placeholder="Album name or AF1Qip... key"
-                autofocus
-              />
-            </div>
+            {{ isExtractingTokenBinding ? 'Reading ADB...' : 'Read from ADB' }}
+          </Button>
+        </div>
 
-            <div class="flex gap-4">
-              <Button
-                variant="outline"
-                class="cursor-pointer select-none"
-                @click="cancelAlbumUpload"
-              >
-                Cancel
-              </Button>
-              <Button
-                class="cursor-pointer select-none"
-                :disabled="!albumNameOrKey.trim()"
-                @click="confirmAlbumUpload"
-              >
-                Upload
-              </Button>
-            </div>
-          </div>
-        </template>
-
-        <!-- Normal UI when not dragging -->
-        <template v-else>
-          <h1 class="text-xl font-semibold select-none">
-            Drop files to upload
-          </h1>
-          <GoogleAccountSelect
-            v-model="selectedOption"
-            :options="options"
-            :removing-account="removingAccount"
-            @item-removed="removeCredentials"
-            @add="openAccountSetup"
-          />
-          <div
-            v-if="tokenBindingEmail"
-            class="w-full max-w-xs border rounded-lg p-3 flex flex-col gap-3"
-            style="--wails-draggable: none"
-          >
-            <p class="text-sm text-muted-foreground">
-              This credential needs a token binding key from the rooted Android device it was captured from.
-            </p>
-            <Button
-              class="cursor-pointer select-none"
-              :disabled="isExtractingTokenBinding"
-              @click="addTokenBindingAliasFromADB"
-            >
-              {{ isExtractingTokenBinding ? 'Reading ADB...' : 'Read from ADB' }}
-            </Button>
-          </div>
-
-          <Sheet>
-            <SheetTrigger>
-              <Button
-                variant="outline"
-                class="cursor-pointer select-none"
-              >
-                Settings
-              </Button>
-            </SheetTrigger>
-            <SheetContent side="bottom">
-              <TooltipProvider disable-hoverable-content>
-                <SettingsPanel />
-              </TooltipProvider>
-            </SheetContent>
-          </Sheet>
-
-          <div
-            v-if="uploadState.uploadedFiles > 0 || uploadState.results.fail.length > 0"
-            class="flex flex-col items-center gap-2 border rounded-lg p-5 mt-5"
-          >
-            <h2 class="text-l font-semibold select-none ">
-              Upload Results
-            </h2>
-            <Label class="text-muted-foreground">Successful: {{ uploadState.results.success.length }}</Label>
-            <Label class="text-muted-foreground">Failed: {{ uploadState.results.fail.length }}</Label>
-            <Label class="text-muted-foreground">Skipped: {{ uploadState.results.skipped.length }}</Label>
-            <Label class="text-muted-foreground">Warnings: {{ uploadState.results.warnings.length }}</Label>
+        <Sheet>
+          <SheetTrigger>
             <Button
               variant="outline"
-              class="cursor-pointer select-none min-w-[125px]"
-              @click="handleCopyClick"
+              class="cursor-pointer select-none"
             >
-              {{ copyButtonText }}
+              Settings
             </Button>
-          </div>
-        </template>
+          </SheetTrigger>
+          <SheetContent side="bottom">
+            <TooltipProvider disable-hoverable-content>
+              <SettingsPanel />
+            </TooltipProvider>
+          </SheetContent>
+        </Sheet>
       </template>
-    </div>
-    <div
-      v-if="uploadState.isUploading"
-      class="w-full h-full"
-    >
-      <Upload />
     </div>
     <GoogleAuthSetup
       v-model:open="isAccountSetupOpen"

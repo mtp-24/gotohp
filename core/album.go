@@ -29,16 +29,22 @@ type AlbumStatus struct {
 	IsComplete bool     `json:"IsComplete"`
 }
 
+// albumAPI is the part of Api that album creation needs.
+type albumAPI interface {
+	CreateAlbum(albumName string, mediaKeys []string) (string, error)
+	AddMediaToAlbum(albumMediaKey string, mediaKeys []string) error
+}
+
 // AlbumManager handles album creation with batching
 type AlbumManager struct {
-	api      *Api
+	api      albumAPI
 	reporter UploadReporter
 	logger   *slog.Logger
 	cancel   <-chan struct{}
 }
 
 // NewAlbumManager creates a new AlbumManager
-func NewAlbumManager(api *Api, reporter UploadReporter, logger *slog.Logger, cancel <-chan struct{}) *AlbumManager {
+func NewAlbumManager(api albumAPI, reporter UploadReporter, logger *slog.Logger, cancel <-chan struct{}) *AlbumManager {
 	return &AlbumManager{
 		api:      api,
 		reporter: reporter,
@@ -82,17 +88,17 @@ func (m *AlbumManager) AddToAlbum(mediaKeys []string, albumNameOrKey string) ([]
 
 	// Check if we're adding to an existing album
 	if IsAlbumKey(albumNameOrKey) {
-		return m.addToExistingAlbum(mediaKeys, albumNameOrKey)
+		return m.addToExistingAlbum(mediaKeys, albumNameOrKey, albumKeyDisplayName(albumNameOrKey))
 	}
 
 	return m.createNewAlbum(mediaKeys, albumNameOrKey)
 }
 
-// addToExistingAlbum adds media to an existing album using the album media key
-func (m *AlbumManager) addToExistingAlbum(mediaKeys []string, albumKey string) ([]string, error) {
+// addToExistingAlbum adds media to an existing album using the album media key.
+// displayName labels progress events.
+func (m *AlbumManager) addToExistingAlbum(mediaKeys []string, albumKey string, displayName string) ([]string, error) {
 	totalItems := len(mediaKeys)
 	itemsAdded := 0
-	displayName := albumKeyDisplayName(albumKey)
 
 	// Process in API-sized batches (500 items per call)
 	for i := 0; i < len(mediaKeys); i += AlbumBatchSize {

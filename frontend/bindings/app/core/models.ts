@@ -339,15 +339,137 @@ export class PreflightWarning {
 }
 
 /**
- * StartUploadEvent is received from frontend to start upload
+ * QueueItem describes one upload item (a file or a Live Photo pair) in the queue.
+ */
+export class QueueItem {
+    "ID": number;
+    "BatchID": number;
+    "Name": string;
+    "Path": string;
+    "Paths": string[];
+    "IsLivePhoto": boolean;
+    "Size": number;
+    "State": QueueItemState;
+    "Message": string;
+    "MediaKey": string;
+
+    /** Creates a new QueueItem instance. */
+    constructor($$source: Partial<QueueItem> = {}) {
+        if (!("ID" in $$source)) {
+            this["ID"] = 0;
+        }
+        if (!("BatchID" in $$source)) {
+            this["BatchID"] = 0;
+        }
+        if (!("Name" in $$source)) {
+            this["Name"] = "";
+        }
+        if (!("Path" in $$source)) {
+            this["Path"] = "";
+        }
+        if (!("Paths" in $$source)) {
+            this["Paths"] = [];
+        }
+        if (!("IsLivePhoto" in $$source)) {
+            this["IsLivePhoto"] = false;
+        }
+        if (!("Size" in $$source)) {
+            this["Size"] = 0;
+        }
+        if (!("State" in $$source)) {
+            this["State"] = QueueItemState.$zero;
+        }
+        if (!("Message" in $$source)) {
+            this["Message"] = "";
+        }
+        if (!("MediaKey" in $$source)) {
+            this["MediaKey"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new QueueItem instance from a string or object.
+     */
+    static createFrom($$source: any = {}): QueueItem {
+        const $$createField4_0 = $$createType2;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("Paths" in $$parsedSource) {
+            $$parsedSource["Paths"] = $$createField4_0($$parsedSource["Paths"]);
+        }
+        return new QueueItem($$parsedSource as Partial<QueueItem>);
+    }
+}
+
+/**
+ * QueueItemState is the lifecycle state of one queued upload item.
+ */
+export enum QueueItemState {
+    /**
+     * The Go zero value for the underlying type of the enum.
+     */
+    $zero = "",
+
+    QueueItemQueued = "queued",
+    QueueItemActive = "active",
+    QueueItemDone = "done",
+    QueueItemFailed = "failed",
+    QueueItemSkipped = "skipped",
+    QueueItemCancelled = "cancelled",
+};
+
+/**
+ * QueueStatus is the queue-wide state shown alongside the items.
+ */
+export class QueueStatus {
+    "Paused": boolean;
+
+    /**
+     * WaitingForNetwork is set while uploads are held after a connection loss.
+     */
+    "WaitingForNetwork": boolean;
+
+    /** Creates a new QueueStatus instance. */
+    constructor($$source: Partial<QueueStatus> = {}) {
+        if (!("Paused" in $$source)) {
+            this["Paused"] = false;
+        }
+        if (!("WaitingForNetwork" in $$source)) {
+            this["WaitingForNetwork"] = false;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new QueueStatus instance from a string or object.
+     */
+    static createFrom($$source: any = {}): QueueStatus {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new QueueStatus($$parsedSource as Partial<QueueStatus>);
+    }
+}
+
+/**
+ * StartUploadEvent is received from the frontend to add files to the queue.
+ * The album choice belongs to this drop only.
  */
 export class StartUploadEvent {
     "files": string[];
+    "albumName": string;
+    "albumAutoMode": boolean;
 
     /** Creates a new StartUploadEvent instance. */
     constructor($$source: Partial<StartUploadEvent> = {}) {
         if (!("files" in $$source)) {
             this["files"] = [];
+        }
+        if (!("albumName" in $$source)) {
+            this["albumName"] = "";
+        }
+        if (!("albumAutoMode" in $$source)) {
+            this["albumAutoMode"] = false;
         }
 
         Object.assign(this, $$source);

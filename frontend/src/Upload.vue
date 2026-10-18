@@ -4,19 +4,26 @@ import Button from "./components/ui/button/Button.vue"
 import { Progress } from "./components/ui/progress"
 import { ScrollArea } from "./components/ui/scroll-area"
 import ThreadProgress from "./components/ThreadProgress.vue"
-import { uploadManager } from './utils/UploadManager'
-import { X, Clock, Zap, FolderPlus, AlertTriangle } from '@lucide/vue'
+import QueueItemRow from "./components/QueueItemRow.vue"
+import { uploadManager, type QueueItem, type QueueItemState } from './utils/UploadManager'
+import { X, Clock, Zap, FolderPlus, AlertTriangle, Pause, Play, RotateCcw, Trash2, WifiOff, Copy, Hourglass } from '@lucide/vue'
 
 const { state } = uploadManager
 
 // Elapsed time ticker
 const elapsedSeconds = ref(0)
 let elapsedInterval: ReturnType<typeof setInterval> | null = null
+// Speed smoothed over roughly the last ten seconds, so the ETA does not jump
+// with every progress sample.
+const smoothedSpeed = ref(0)
 
 onMounted(() => {
   elapsedInterval = setInterval(() => {
-    if (state.startTime > 0) {
+    if (state.startTime > 0 && state.isUploading) {
       elapsedSeconds.value = Math.floor((Date.now() - state.startTime) / 1000)
+      smoothedSpeed.value = smoothedSpeed.value === 0
+        ? state.uploadSpeed
+        : smoothedSpeed.value * 0.8 + state.uploadSpeed * 0.2
     }
   }, 1000)
 })
@@ -33,29 +40,66 @@ const threadsList = computed(() => {
     .sort((a, b) => a.WorkerID - b.WorkerID)
 })
 
+const runItems = computed(() => state.items.filter(item => item.runId === state.runId))
+const runFinished = computed(() => runItems.value.filter(item => item.State !== 'queued' && item.State !== 'active').length)
+
 const progressPercent = computed(() => {
-  if (state.totalFiles === 0) return 0
-  return Math.round((state.uploadedFiles / state.totalFiles) * 100)
+  if (runItems.value.length === 0) return 0
+  return Math.round((runFinished.value / runItems.value.length) * 100)
 })
+
+type Filter = 'all' | QueueItemState
+const filter = ref<Filter>('all')
+const filters: { value: Filter; label: string }[] = [
+  { value: 'all', label: 'All' },
+  { value: 'queued', label: 'Queued' },
+  { value: 'active', label: 'Active' },
+  { value: 'done', label: 'Done' },
+  { value: 'failed', label: 'Failed' },
+  { value: 'skipped', label: 'Skipped' },
+  { value: 'cancelled', label: 'Cancelled' },
+]
+
+const counts = computed(() => {
+  const result: Record<Filter, number> = { all: state.items.length, queued: 0, active: 0, done: 0, failed: 0, skipped: 0, cancelled: 0 }
+  for (const item of state.items) {
+    result[item.State]++
+  }
+  return result
+})
+
+// Rendering thousands of rows at once stalls the webview; grow the list on demand.
+const pageSize = 200
+const visibleCount = ref(pageSize)
+const filteredItems = computed<QueueItem[]>(() => {
+  if (filter.value === 'all') return state.items
+  return state.items.filter(item => item.State === filter.value)
+})
+const visibleItems = computed(() => filteredItems.value.slice(0, visibleCount.value))
+
+function setFilter(value: Filter) {
+  filter.value = value
+  visibleCount.value = pageSize
+}
+
+const activeThreadFor = (item: QueueItem) => threadsList.value.find(thread => thread.FilePath === item.Path)
 
 // Format bytes to human readable
 function formatBytes(bytes: number, decimals = 1): string {
-  if (bytes === 0) return '0 B'
+  if (bytes <= 0) return '0 B'
   const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB']
-  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1)
   return parseFloat((bytes / Math.pow(k, i)).toFixed(decimals)) + ' ' + sizes[i]
 }
 
-// Format speed
 const speedDisplay = computed(() => {
-  if (state.uploadSpeed <= 0) return '--'
+  if (!state.isUploading || state.uploadSpeed <= 0) return '--'
   return formatBytes(state.uploadSpeed) + '/s'
 })
 
-// Format elapsed time
-const elapsedDisplay = computed(() => {
-  const seconds = elapsedSeconds.value
+function formatDuration(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.round(totalSeconds))
   if (seconds < 60) return `${seconds}s`
   const mins = Math.floor(seconds / 60)
   const secs = seconds % 60
@@ -63,39 +107,81 @@ const elapsedDisplay = computed(() => {
   const hours = Math.floor(mins / 60)
   const remainingMins = mins % 60
   return `${hours}h ${remainingMins}m`
+}
+
+const elapsedDisplay = computed(() => formatDuration(elapsedSeconds.value))
+
+// Time left for the queued and active items: remaining bytes over the smoothed
+// speed, or, before any bytes move, the average time per finished item.
+const etaDisplay = computed(() => {
+  if (!state.isUploading || state.queueStatus.Paused || state.queueStatus.WaitingForNetwork) return '--'
+  const remainingItems = runItems.value.length - runFinished.value
+  if (remainingItems <= 0) return '--'
+  const remainingBytes = state.totalBytes - state.uploadedBytes
+  if (remainingBytes > 0 && smoothedSpeed.value > 0) {
+    return formatDuration(remainingBytes / smoothedSpeed.value)
+  }
+  if (runFinished.value > 0 && elapsedSeconds.value > 0) {
+    return formatDuration((elapsedSeconds.value / runFinished.value) * remainingItems)
+  }
+  return '--'
 })
 
-// Bytes progress display
 const bytesDisplay = computed(() => {
   if (state.totalBytes === 0) return ''
   return `${formatBytes(state.uploadedBytes)} / ${formatBytes(state.totalBytes)}`
 })
 
-// Album progress display
 const albumProgressPercent = computed(() => {
   if (!state.albumStatus || state.albumStatus.TotalItems === 0) return 0
   return Math.round((state.albumStatus.ItemsAdded / state.albumStatus.TotalItems) * 100)
 })
 
+const hasPendingUploads = computed(() => counts.value.queued > 0 || counts.value.active > 0)
+
+const statusLabel = computed(() => {
+  if (!state.isUploading) return 'Finished'
+  if (state.queueStatus.WaitingForNetwork) return 'Waiting for connection'
+  if (state.queueStatus.Paused) return counts.value.active > 0 ? 'Pausing after current items' : 'Paused'
+  if (!hasPendingUploads.value && state.isCreatingAlbum) return 'Adding to album'
+  if (!hasPendingUploads.value) return 'Scanning'
+  return 'Uploading'
+})
+
+const showWarnings = ref(false)
+
 function warningFiles(paths: string[]): string {
   return paths.map(path => path.split(/[\\/]/).pop()).filter(Boolean).join(', ')
+}
+
+const copyLabel = ref('Copy JSON')
+async function copyResults() {
+  const copied = await uploadManager.copyResultsAsJson()
+  copyLabel.value = copied ? 'Copied!' : 'Copy failed'
+  setTimeout(() => copyLabel.value = 'Copy JSON', 1000)
 }
 </script>
 
 <template>
-  <div class="flex flex-col h-full w-full px-4 pt-6 pb-4">
-    <!-- Header with file count -->
-    <div class="text-center mb-3">
+  <div
+    class="flex flex-col h-full w-full px-4 pt-8 pb-4 gap-3"
+    style="--wails-draggable: none"
+  >
+    <!-- Header -->
+    <div class="text-center">
       <p class="text-2xl font-bold tabular-nums">
-        {{ state.uploadedFiles }}<span class="text-muted-foreground font-normal">/</span><span class="text-muted-foreground">{{ state.totalFiles }}</span>
+        {{ runFinished }}<span class="text-muted-foreground font-normal">/</span><span class="text-muted-foreground">{{ runItems.length }}</span>
       </p>
-      <p class="text-xs text-muted-foreground">
-        items processed
+      <p class="text-xs text-muted-foreground flex items-center justify-center gap-1.5">
+        <WifiOff
+          v-if="state.queueStatus.WaitingForNetwork"
+          :size="12"
+        />
+        {{ statusLabel }}
       </p>
     </div>
 
-    <!-- Stats row -->
-    <div class="flex gap-3 justify-center mb-3 text-xs text-muted-foreground">
+    <div class="flex gap-3 justify-center text-xs text-muted-foreground">
       <div class="flex items-center gap-1.5">
         <Zap :size="12" />
         <span class="tabular-nums text-foreground">{{ speedDisplay }}</span>
@@ -105,10 +191,18 @@ function warningFiles(paths: string[]): string {
         <Clock :size="12" />
         <span class="tabular-nums text-foreground">{{ elapsedDisplay }}</span>
       </div>
+      <span class="text-border">|</span>
+      <div
+        class="flex items-center gap-1.5"
+        title="Estimated time left for the queued items"
+      >
+        <Hourglass :size="12" />
+        <span class="tabular-nums text-foreground">{{ etaDisplay }}</span>
+        <span>left</span>
+      </div>
     </div>
 
-    <!-- Main progress bar -->
-    <div class="mb-4">
+    <div>
       <Progress
         :model-value="progressPercent"
         class="h-2.5"
@@ -120,10 +214,70 @@ function warningFiles(paths: string[]): string {
       </div>
     </div>
 
+    <!-- Queue controls -->
+    <div class="flex gap-2">
+      <template v-if="state.isUploading">
+        <Button
+          variant="outline"
+          size="sm"
+          class="flex-1 cursor-pointer"
+          @click="uploadManager.setPaused(!state.queueStatus.Paused)"
+        >
+          <Play
+            v-if="state.queueStatus.Paused"
+            :size="14"
+          />
+          <Pause
+            v-else
+            :size="14"
+          />
+          {{ state.queueStatus.Paused ? 'Resume' : 'Pause' }}
+        </Button>
+        <Button
+          variant="destructive"
+          size="sm"
+          class="flex-1 cursor-pointer"
+          @click="uploadManager.cancelUpload()"
+        >
+          <X :size="14" />
+          {{ hasPendingUploads ? 'Cancel all' : 'Stop album' }}
+        </Button>
+      </template>
+      <template v-else>
+        <Button
+          v-if="counts.failed > 0"
+          variant="outline"
+          size="sm"
+          class="flex-1 cursor-pointer"
+          @click="uploadManager.retryFailed()"
+        >
+          <RotateCcw :size="14" />
+          Retry failed ({{ counts.failed }})
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          class="flex-1 cursor-pointer"
+          @click="copyResults"
+        >
+          <Copy :size="14" />
+          {{ copyLabel }}
+        </Button>
+        <Button
+          size="sm"
+          class="flex-1 cursor-pointer"
+          @click="uploadManager.clearFinished()"
+        >
+          <Trash2 :size="14" />
+          Clear list
+        </Button>
+      </template>
+    </div>
+
     <!-- Album creation progress -->
     <div
       v-if="state.albumStatus && (state.isCreatingAlbum || state.albumStatus.IsComplete)"
-      class="mb-3 p-3 rounded-lg border bg-muted/30"
+      class="p-3 rounded-lg border bg-muted/30"
     >
       <div class="flex items-center gap-2 mb-2">
         <FolderPlus
@@ -133,10 +287,8 @@ function warningFiles(paths: string[]): string {
         <span class="text-sm font-medium">
           {{ state.isCreatingAlbum ? 'Adding to album...' : 'Added to album' }}
         </span>
+        <span class="ml-auto text-xs text-muted-foreground truncate">{{ state.albumStatus.AlbumName }}</span>
       </div>
-      <p class="text-xs text-muted-foreground mb-1.5">
-        {{ state.albumStatus.AlbumName }}
-      </p>
       <Progress
         :model-value="albumProgressPercent"
         class="h-1.5"
@@ -146,20 +298,25 @@ function warningFiles(paths: string[]): string {
       </p>
     </div>
 
-    <div
-      v-if="state.warnings.length"
-      class="mb-3 space-y-1.5"
-    >
-      <div
-        v-for="(warning, index) in state.warnings"
-        :key="`${warning.Code}-${index}`"
-        class="flex gap-2 rounded-md bg-amber-500/10 px-2.5 py-2 text-amber-700 dark:text-amber-300"
+    <!-- Warnings, collapsed by default -->
+    <div v-if="state.warnings.length">
+      <button
+        class="flex w-full items-center gap-2 rounded-md bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-700 dark:text-amber-300 cursor-pointer"
+        @click="showWarnings = !showWarnings"
       >
-        <AlertTriangle
-          :size="14"
-          class="mt-0.5 shrink-0"
-        />
-        <div class="min-w-0">
+        <AlertTriangle :size="14" />
+        {{ state.warnings.length }} warning(s)
+        <span class="ml-auto opacity-75">{{ showWarnings ? 'Hide' : 'Show' }}</span>
+      </button>
+      <div
+        v-if="showWarnings"
+        class="mt-1.5 max-h-32 overflow-y-auto space-y-1.5"
+      >
+        <div
+          v-for="(warning, index) in state.warnings"
+          :key="`${warning.Code}-${index}`"
+          class="rounded-md bg-amber-500/10 px-2.5 py-1.5 text-amber-700 dark:text-amber-300"
+        >
           <p class="text-xs leading-snug">
             {{ warning.Message }}
           </p>
@@ -170,34 +327,66 @@ function warningFiles(paths: string[]): string {
       </div>
     </div>
 
-    <!-- Thread list - scrollable -->
-    <div class="flex-1 min-h-0 mb-3">
-      <p class="text-xs text-muted-foreground mb-1.5">
-        Active threads ({{ threadsList.length }})
-      </p>
-      <ScrollArea class="h-[calc(100%-20px)]">
-        <div class="space-y-1.5 pr-3">
-          <ThreadProgress
-            v-for="thread in threadsList"
-            :key="thread.WorkerID"
-            :thread="thread"
+    <!-- Active uploads with live progress -->
+    <div
+      v-if="threadsList.length"
+      class="space-y-1.5 max-h-48 overflow-y-auto"
+    >
+      <ThreadProgress
+        v-for="thread in threadsList"
+        :key="thread.WorkerID"
+        :thread="thread"
+      />
+    </div>
+
+    <!-- Filters -->
+    <div class="flex flex-wrap gap-1">
+      <button
+        v-for="option in filters"
+        :key="option.value"
+        :class="[
+          'rounded-full px-2 py-0.5 text-[11px] border cursor-pointer tabular-nums',
+          filter === option.value ? 'bg-primary text-primary-foreground border-primary' : 'text-muted-foreground hover:bg-muted'
+        ]"
+        @click="setFilter(option.value)"
+      >
+        {{ option.label }} {{ counts[option.value] }}
+      </button>
+    </div>
+
+    <!-- Item list -->
+    <div class="flex-1 min-h-0">
+      <ScrollArea class="h-full">
+        <div class="space-y-1 pr-3">
+          <QueueItemRow
+            v-for="item in visibleItems"
+            :key="item.ID"
+            :item="item"
+            :thread="item.State === 'active' ? activeThreadFor(item) : undefined"
+            @cancel="uploadManager.cancelItem(item.ID)"
+            @retry="uploadManager.retryItem(item.ID)"
           />
+          <p
+            v-if="filteredItems.length === 0"
+            class="py-6 text-center text-xs text-muted-foreground"
+          >
+            {{ state.isUploading ? 'Scanning files...' : 'No items' }}
+          </p>
+          <Button
+            v-if="filteredItems.length > visibleCount"
+            variant="ghost"
+            size="sm"
+            class="w-full cursor-pointer"
+            @click="visibleCount += pageSize"
+          >
+            Show more ({{ filteredItems.length - visibleCount }} hidden)
+          </Button>
         </div>
       </ScrollArea>
     </div>
 
-    <!-- Cancel button - fixed at bottom -->
-    <Button
-      variant="destructive"
-      size="sm"
-      class="w-full"
-      @click="() => uploadManager.cancelUpload()"
-    >
-      <X
-        :size="14"
-        class="mr-1"
-      />
-      Cancel Upload
-    </Button>
+    <p class="text-center text-[11px] text-muted-foreground select-none">
+      Drop more files here to add them to the queue
+    </p>
   </div>
 </template>

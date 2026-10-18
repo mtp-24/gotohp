@@ -18,8 +18,16 @@ declare module "@wailsio/runtime" {
             "albumError": core$0.AlbumError;
             "albumProgress": core$0.AlbumStatus;
             "files-dropped": core$0.FilesDroppedEvent;
+            "queueItemUpdate": core$0.QueueItem;
+            "queueItems": core$0.QueueItem[];
+            "queueStatus": core$0.QueueStatus;
             "startUpload": core$0.StartUploadEvent;
             "uploadCancel": void;
+            "uploadCancelItem": number;
+            "uploadClearFinished": void;
+            "uploadPause": boolean;
+            "uploadRetryFailed": void;
+            "uploadRetryItem": number;
             "uploadStart": core$0.UploadBatchStart;
             "uploadStop": void;
             "uploadTotalBytes": number;

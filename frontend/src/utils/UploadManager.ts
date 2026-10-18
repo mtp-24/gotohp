@@ -56,8 +56,34 @@ function isSkippedUploadWarning(code: string): boolean {
   return code === "incomplete-live-photo-skipped" || code === "ambiguous-filename-stem";
 }
 
+export type QueueItemState = "queued" | "active" | "done" | "failed" | "skipped" | "cancelled";
+
+export interface QueueItem {
+  ID: number;
+  BatchID: number;
+  Name: string;
+  Path: string;
+  Paths: string[];
+  IsLivePhoto: boolean;
+  Size: number;
+  State: QueueItemState;
+  Message: string;
+  MediaKey: string;
+  // Frontend-only: the run the item last joined, for per-run progress.
+  runId: number;
+}
+
+export interface QueueStatus {
+  Paused: boolean;
+  WaitingForNetwork: boolean;
+}
+
 export interface UploadState {
   isUploading: boolean;
+  // Every item since the list was last cleared, in queue order.
+  items: QueueItem[];
+  runId: number;
+  queueStatus: QueueStatus;
   totalFiles: number;
   uploadedFiles: number;
   threads: Map<number, ThreadStatus>;
@@ -81,6 +107,9 @@ class UploadManager {
   // Reactive state that can be accessed by components
   public state = reactive<UploadState>({
     isUploading: false,
+    items: [],
+    runId: 0,
+    queueStatus: { Paused: false, WaitingForNetwork: false },
     totalFiles: 0,
     uploadedFiles: 0,
     threads: new Map<number, ThreadStatus>(),
@@ -109,12 +138,15 @@ class UploadManager {
   private fileBytes: Map<string, number> = new Map();
   // Dedupe decisions can change the bytes that will actually be uploaded.
   private totalBytesAdjustment: number = 0;
+  // Index into state.items by item ID.
+  private itemIndex: Map<number, number> = new Map();
 
   private constructor() {
     // Bind all methods to ensure 'this' context is preserved
     this.resetUploadResults = this.resetUploadResults.bind(this);
     this.cancelUpload = this.cancelUpload.bind(this);
     this.copyResultsAsJson = this.copyResultsAsJson.bind(this);
+    this.clearFinished = this.clearFinished.bind(this);
 
     this.setupEventListeners();
   }
@@ -128,23 +160,53 @@ class UploadManager {
 
   private setupEventListeners() {
     // Handle upload start
+    // Sent when a run begins and again whenever files join it; Total is the
+    // run's running item count. Only the first one resets per-run counters.
     Events.On("uploadStart", (event: { data: UploadBatchStart }) => {
+      if (!this.state.isUploading) {
+        this.state.runId++;
+        this.state.totalBytes = 0;
+        this.state.uploadedFiles = 0;
+        this.state.uploadedBytes = 0;
+        this.state.isUploading = true;
+        this.state.threads.clear();
+        this.state.startTime = Date.now();
+        this.state.uploadSpeed = 0;
+        this.state.albumStatus = null;
+        this.state.queueStatus = { Paused: false, WaitingForNetwork: false };
+        this.lastSpeedUpdate = Date.now();
+        this.lastBytesUploaded = 0;
+        this.speedSamples = [];
+        this.completedBytes = 0;
+        this.fileBytes.clear();
+        this.totalBytesAdjustment = 0;
+      }
       this.state.totalFiles = event.data.Total;
-      this.state.totalBytes = event.data.TotalBytes; // May be 0 initially
-      this.state.uploadedFiles = 0;
-      this.state.uploadedBytes = 0;
-      this.state.isUploading = true;
-      this.state.threads.clear();
-      this.state.startTime = Date.now();
-      this.state.uploadSpeed = 0;
-      this.lastSpeedUpdate = Date.now();
-      this.lastBytesUploaded = 0;
-      this.speedSamples = [];
-      this.completedBytes = 0;
-      this.fileBytes.clear();
-      this.totalBytesAdjustment = 0;
-      this.resetUploadResults();
-      this.state.warnings = [];
+    });
+
+    Events.On("queueItems", (event: { data: QueueItem[] }) => {
+      for (const item of event.data) {
+        // An update for the same item may already have arrived.
+        if (!this.itemIndex.has(item.ID)) {
+          this.insertItem(item);
+        }
+      }
+    });
+
+    Events.On("queueItemUpdate", (event: { data: QueueItem }) => {
+      const index = this.itemIndex.get(event.data.ID);
+      if (index === undefined) {
+        this.insertItem(event.data);
+        return;
+      }
+      const runId = event.data.State === "queued" || event.data.State === "active"
+        ? this.state.runId
+        : this.state.items[index].runId;
+      this.state.items[index] = { ...event.data, runId };
+    });
+
+    Events.On("queueStatus", (event: { data: QueueStatus }) => {
+      this.state.queueStatus = event.data;
     });
 
     // Handle async total bytes update (calculated after uploadStart)
@@ -200,17 +262,6 @@ class UploadManager {
         this.fileBytes.delete(completedPath);
       }
       this.updateBytesAndSpeed();
-
-      // Skipped-only batches can begin and end within one backend event burst.
-      // Finishing locally prevents a missed terminal event from leaving the timer running.
-      if (
-        this.state.totalFiles > 0
-        && this.state.uploadedFiles >= this.state.totalFiles
-        && this.state.results.success.length === 0
-        && this.state.results.fail.length === 0
-      ) {
-        this.state.isUploading = false;
-      }
     });
 
     // Handle upload stop
@@ -284,8 +335,45 @@ class UploadManager {
     this.state.results.warnings = [];
   }
 
+  private insertItem(item: QueueItem) {
+    this.itemIndex.set(item.ID, this.state.items.length);
+    this.state.items.push({ ...item, runId: this.state.runId });
+  }
+
   public cancelUpload() {
     Events.Emit("uploadCancel");
+  }
+
+  public setPaused(paused: boolean) {
+    Events.Emit("uploadPause", paused);
+  }
+
+  public cancelItem(id: number) {
+    Events.Emit("uploadCancelItem", id);
+  }
+
+  public retryItem(id: number) {
+    Events.Emit("uploadRetryItem", id);
+  }
+
+  public retryFailed() {
+    Events.Emit("uploadRetryFailed");
+  }
+
+  // Drops finished items from the list, and their results, keeping anything
+  // still queued or uploading.
+  public clearFinished() {
+    Events.Emit("uploadClearFinished");
+    const remaining = this.state.items.filter(item => item.State === "queued" || item.State === "active");
+    this.state.items = remaining;
+    this.itemIndex = new Map(remaining.map((item, index) => [item.ID, index]));
+    this.resetUploadResults();
+    this.state.warnings = [];
+    if (!this.state.isUploading) {
+      this.state.uploadedFiles = 0;
+      this.state.totalFiles = 0;
+      this.state.albumStatus = null;
+    }
   }
 
   public async copyResultsAsJson() {

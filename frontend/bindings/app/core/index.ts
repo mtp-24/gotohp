@@ -15,6 +15,9 @@ export {
     FilesDroppedEvent,
     Preferences,
     PreflightWarning,
+    QueueItem,
+    QueueItemState,
+    QueueStatus,
     StartUploadEvent,
     ThreadStatus,
     UploadBatchStart
