@@ -92,7 +92,7 @@ func (m *AlbumManager) AddToAlbum(mediaKeys []string, albumNameOrKey string) ([]
 func (m *AlbumManager) addToExistingAlbum(mediaKeys []string, albumKey string) ([]string, error) {
 	totalItems := len(mediaKeys)
 	itemsAdded := 0
-	displayName := fmt.Sprintf("Album (%s...)", albumKey[:10])
+	displayName := albumKeyDisplayName(albumKey)
 
 	// Process in API-sized batches (500 items per call)
 	for i := 0; i < len(mediaKeys); i += AlbumBatchSize {
@@ -131,6 +131,16 @@ func (m *AlbumManager) addToExistingAlbum(mediaKeys []string, albumKey string) (
 	})
 
 	return []string{albumKey}, nil
+}
+
+// albumKeyDisplayName shortens an album key for progress messages. Keys
+// shorter than the prefix length are shown whole instead of panicking.
+func albumKeyDisplayName(albumKey string) string {
+	const prefixLen = 10
+	if len(albumKey) <= prefixLen {
+		return fmt.Sprintf("Album (%s)", albumKey)
+	}
+	return fmt.Sprintf("Album (%s...)", albumKey[:prefixLen])
 }
 
 // addMediaWithRetry adds media to an album with retry logic
