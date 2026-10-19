@@ -117,10 +117,15 @@ const filteredItems = computed<QueueItem[]>(() => {
   if (filter.value === 'all') return state.items
   return state.items.filter(item => item.State === filter.value)
 })
-// Most recently changed first: what just started, finished or failed is on
-// top, and queued files follow, newest drop first.
+// Queued and Active are in upload order, so the next file is on top and
+// files leave as they move on. The other tabs grow as files finish, so they
+// show the most recently changed first: new results appear on top.
+const uploadOrderFilters: Filter[] = ['queued', 'active']
 const visibleItems = computed(() => {
   void state.listVersion
+  if (uploadOrderFilters.includes(filter.value)) {
+    return filteredItems.value.slice(0, visibleCount.value)
+  }
   return newestFirst(filteredItems.value, visibleCount.value)
 })
 
