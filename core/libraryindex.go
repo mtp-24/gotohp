@@ -56,13 +56,21 @@ func (l *libraryListing) finish(items []LibraryItem, albums []LibraryAlbum, page
 		l.byTitle[album.Title] = append(l.byTitle[album.Title], album)
 	}
 	l.byHash = make(map[string]string, len(items))
+	addedAt := make(map[string]int64, len(items))
 	for _, item := range items {
 		// Items in the trash or the Locked Folder do not count as being in
 		// the library; those files are looked up one by one instead.
 		if item.InTrash || item.IsLocked || item.DedupKey == "" {
 			continue
 		}
-		l.byHash[strings.TrimRight(item.DedupKey, "=")] = item.MediaKey
+		// With several copies of a file, Google's lookup answers with the
+		// oldest; so does the listing, so albums get the same copy.
+		fp := strings.TrimRight(item.DedupKey, "=")
+		if at, seen := addedAt[fp]; seen && at <= item.AddedAt {
+			continue
+		}
+		l.byHash[fp] = item.MediaKey
+		addedAt[fp] = item.AddedAt
 	}
 }
 

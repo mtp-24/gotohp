@@ -99,3 +99,16 @@ func TestQueueWaitsForLibraryListing(t *testing.T) {
 		t.Fatalf("library check = %+v", check)
 	}
 }
+
+func TestLibraryListingAnswersWithTheOldestCopy(t *testing.T) {
+	hash := sha1.Sum([]byte("copied"))
+	listing := newLibraryListing()
+	listing.finish([]LibraryItem{
+		{MediaKey: "key-second", DedupKey: dedupKey(hash), AddedAt: 200},
+		{MediaKey: "key-first", DedupKey: dedupKey(hash), AddedAt: 100},
+		{MediaKey: "key-third", DedupKey: dedupKey(hash), AddedAt: 300},
+	}, nil, 1, nil)
+	if got := listing.find(hash[:]); got != "key-first" {
+		t.Fatalf("find = %q, want the oldest copy, as Google's lookup answers", got)
+	}
+}
