@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -1058,7 +1059,10 @@ func (m *UploadManager) finishItem(workerID int, entry *queueEntry, ctx context.
 			accountProblem = "Google rejected this account's credential. Add the account again, then press Resume."
 		}
 	}
-	rateLimited := err != nil && !cancelled && mediaKey == "" && isAPIErr && apiErr.RateLimited()
+	// A lookup with no answer is treated like a rate limit: the file waits
+	// and is checked again, and is never uploaded on a guess.
+	rateLimited := err != nil && !cancelled && mediaKey == "" &&
+		(isAPIErr && apiErr.RateLimited() || errors.Is(err, errLookupNoAnswer))
 	network := err != nil && !cancelled && mediaKey == "" && isNetworkError(err)
 
 	m.mu.Lock()

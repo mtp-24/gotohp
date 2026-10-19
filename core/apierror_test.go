@@ -150,31 +150,39 @@ func TestQueuePausesAfterRateLimit(t *testing.T) {
 	rateLimitPauseStart, rateLimitPauseMax = 50*time.Millisecond, 200*time.Millisecond
 	t.Cleanup(func() { rateLimitPauseStart, rateLimitPauseMax = start, maxPause })
 
-	m, rec, up, _ := newTestQueue(t)
-	paths := writeMedia(t, t.TempDir(), "a.jpg")
+	for name, failure := range map[string]error{
+		"HTTP 429": &APIError{StatusCode: http.StatusTooManyRequests},
+		// A lookup that did not answer must not count as "not found".
+		"unanswered lookup": fmt.Errorf("check whether the file is already in the library: %w", errLookupNoAnswer),
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, rec, up, _ := newTestQueue(t)
+			paths := writeMedia(t, t.TempDir(), "a.jpg")
 
-	m.Upload(paths, testOpts(1))
-	up.waitStarted(t, "a.jpg")
-	began := time.Now()
-	up.gate("a.jpg") <- &APIError{StatusCode: http.StatusTooManyRequests}
-	up.waitStarted(t, "a.jpg")
-	if waited := time.Since(began); waited < 40*time.Millisecond {
-		t.Fatalf("retried after %s, want a pause", waited)
-	}
-	up.gate("a.jpg") <- nil
-	rec.waitStop(t)
+			m.Upload(paths, testOpts(1))
+			up.waitStarted(t, "a.jpg")
+			began := time.Now()
+			up.gate("a.jpg") <- failure
+			up.waitStarted(t, "a.jpg")
+			if waited := time.Since(began); waited < 40*time.Millisecond {
+				t.Fatalf("retried after %s, want a pause", waited)
+			}
+			up.gate("a.jpg") <- nil
+			rec.waitStop(t)
 
-	rec.mu.Lock()
-	defer rec.mu.Unlock()
-	sawPause := false
-	for _, s := range rec.statuses {
-		sawPause = sawPause || s.RateLimitedUntil > 0
-	}
-	if !sawPause {
-		t.Fatal("queue never reported a rate-limit pause")
-	}
-	if got := rec.items[1].State; got != QueueItemDone {
-		t.Fatalf("state = %q, want done", got)
+			rec.mu.Lock()
+			defer rec.mu.Unlock()
+			sawPause := false
+			for _, s := range rec.statuses {
+				sawPause = sawPause || s.RateLimitedUntil > 0
+			}
+			if !sawPause {
+				t.Fatal("queue never reported a rate-limit pause")
+			}
+			if got := rec.items[1].State; got != QueueItemDone {
+				t.Fatalf("state = %q, want done", got)
+			}
+		})
 	}
 }
 

@@ -350,7 +350,7 @@ func (a *Api) FindRemoteMediaByHash(shaHash []byte) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal protobuf: %w", err)
 	}
-	return a.findRemoteMedia(serializedData)
+	return a.findRemoteMedia(serializedData, shaHash)
 }
 
 // FindLivePhotoMotionByHash looks up a video SHA-1 the way the Google Photos
@@ -374,10 +374,15 @@ func (a *Api) FindLivePhotoMotionByHash(shaHash []byte) (string, error) {
 	var body []byte
 	body = protowire.AppendTag(body, 1, protowire.BytesType)
 	body = protowire.AppendBytes(body, lookup)
-	return a.findRemoteMedia(body)
+	return a.findRemoteMedia(body, shaHash)
 }
 
-func (a *Api) findRemoteMedia(serializedData []byte) (string, error) {
+// errLookupNoAnswer marks a lookup reply that neither names an item nor says
+// the file is not there. Read as "not found", such a reply would upload a
+// file that is already in the library again, as a duplicate.
+var errLookupNoAnswer = errors.New("google's reply did not say whether the file is in the library")
+
+func (a *Api) findRemoteMedia(serializedData, shaHash []byte) (string, error) {
 	// The x-goog-ext headers the commit RPCs send must not be added here; the
 	// lookup rejects them with HTTP 400.
 	headers := map[string]string{
@@ -408,7 +413,16 @@ func (a *Api) findRemoteMedia(serializedData []byte) (string, error) {
 	if err := proto.Unmarshal(bodyBytes, &pbResp); err != nil {
 		return "", fmt.Errorf("failed to unmarshal protobuf: %w", err)
 	}
-	return pbResp.GetMediaKey(), nil
+	if key := pbResp.GetMediaKey(); key != "" {
+		return key, nil
+	}
+	// A real "not found" repeats the queried hash at 1.2.1.1; anything else
+	// is no answer at all.
+	decoded, err := decodePB(bodyBytes)
+	if err != nil || !bytes.Equal(decoded.bytes(1, 2, 1, 1), shaHash) {
+		return "", errLookupNoAnswer
+	}
+	return "", nil
 }
 
 // UploadProgressCallback is called with progress updates during file upload

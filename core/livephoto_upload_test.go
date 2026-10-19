@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -58,9 +59,8 @@ func TestFindLivePhotoMotionByHashRequestLayout(t *testing.T) {
 		authResponseCache: map[string]string{"Expiry": "9999999999", "Auth": "token"},
 	}
 	hash := []byte("0123456789abcdefghij")
-	if _, err := api.FindLivePhotoMotionByHash(hash); err != nil {
-		t.Fatal(err)
-	}
+	// Only the request matters here; the empty reply is no answer.
+	_, _ = api.FindLivePhotoMotionByHash(hash)
 
 	// {1: {1: {1: sha1, 5: 2}, 2: {}}}
 	_, lookup, _ := field(t, transport.body, 1)
@@ -76,9 +76,7 @@ func TestFindLivePhotoMotionByHashRequestLayout(t *testing.T) {
 	}
 
 	// The plain lookup is the same message without field 5.
-	if _, err := api.FindRemoteMediaByHash(hash); err != nil {
-		t.Fatal(err)
-	}
+	_, _ = api.FindRemoteMediaByHash(hash)
 	_, plainLookup, _ := field(t, transport.body, 1)
 	_, plainQuery, _ := field(t, plainLookup, 1)
 	if want := protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), hash); !bytes.Equal(plainQuery, want) {
@@ -213,5 +211,46 @@ func TestUploadRetryStartsNewSession(t *testing.T) {
 	if len(transport.urls) != 2 ||
 		!strings.HasSuffix(transport.urls[0], "upload_id=first") || !strings.HasSuffix(transport.urls[1], "upload_id=second") {
 		t.Fatalf("urls = %v, want a new session on the retry", transport.urls)
+	}
+}
+
+// replyTransport answers every request with body.
+type replyTransport struct{ body []byte }
+
+func (r replyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	_, _ = io.Copy(io.Discard, req.Body)
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(r.body))}, nil
+}
+
+// notFoundReply is Google's "not found" lookup reply, which repeats the
+// queried hash at 1.2.1.1.
+func notFoundReply(hash []byte) []byte {
+	inner := protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), hash)
+	query := protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), inner)
+	match := protowire.AppendBytes(protowire.AppendTag(nil, 2, protowire.BytesType), query)
+	return protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), match)
+}
+
+func TestLookupWithoutAnswerIsAnError(t *testing.T) {
+	hash := []byte("0123456789abcdefghij")
+	for _, tc := range []struct {
+		name  string
+		reply []byte
+		want  error
+	}{
+		{"not found", notFoundReply(hash), nil},
+		{"empty reply", nil, errLookupNoAnswer},
+		{"another file's reply", notFoundReply([]byte("jihgfedcba9876543210")), errLookupNoAnswer},
+	} {
+		api := &Api{
+			client:            &http.Client{Transport: replyTransport{tc.reply}},
+			authResponseCache: map[string]string{"Expiry": "9999999999", "Auth": "token"},
+		}
+		for kind, lookup := range map[string]func([]byte) (string, error){"plain": api.FindRemoteMediaByHash, "motion": api.FindLivePhotoMotionByHash} {
+			key, err := lookup(hash)
+			if key != "" || !errors.Is(err, tc.want) {
+				t.Errorf("%s, %s lookup: key=%q err=%v, want %v", tc.name, kind, key, err, tc.want)
+			}
+		}
 	}
 }
