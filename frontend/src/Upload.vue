@@ -9,7 +9,7 @@ import { uploadManager, type QueueItem, type QueueItemState } from './utils/Uplo
 import { Sheet, SheetContent, SheetTrigger } from './components/ui/sheet'
 import { TooltipProvider } from './components/ui/tooltip'
 import SettingsPanel from './SettingsPanel.vue'
-import { Settings, X, Clock, Zap, FolderPlus, AlertTriangle, Pause, Play, RotateCcw, Trash2, WifiOff, Copy, Hourglass, Upload as UploadIcon } from '@lucide/vue'
+import { Settings, X, Clock, Zap, AlertTriangle, Pause, Play, RotateCcw, Trash2, WifiOff, Copy, Hourglass, Upload as UploadIcon, Loader2, CheckCircle2, Check } from '@lucide/vue'
 
 const { state } = uploadManager
 
@@ -59,6 +59,7 @@ const stats = computed(() => {
   const counts: Record<Filter, number> = { all: state.items.length, queued: 0, active: 0, done: 0, failed: 0, skipped: 0, cancelled: 0 }
   let runTotal = 0
   let runFinished = 0
+  let runCancelled = 0
   let uploadableSkips = 0
   // Work in this run, measured in bytes plus a fixed cost per file.
   let runWork = 0
@@ -73,19 +74,24 @@ const stats = computed(() => {
       if (item.State !== 'queued' && item.State !== 'active') {
         runFinished++
         runWorkFinished += work
+        if (item.State === 'cancelled') runCancelled++
       }
     }
   }
-  return { counts, runTotal, runFinished, uploadableSkips, runWork, runWorkFinished }
+  return { counts, runTotal, runFinished, runCancelled, uploadableSkips, runWork, runWorkFinished }
 })
 const counts = computed(() => stats.value.counts)
 const runTotal = computed(() => stats.value.runTotal)
 const runFinished = computed(() => stats.value.runFinished)
+// Processed items went through the queue: uploaded, skipped or failed.
+// Cancelled items were never processed, so they are counted apart.
+const runCancelled = computed(() => stats.value.runCancelled)
+const runProcessed = computed(() => runFinished.value - runCancelled.value)
 const uploadableSkips = computed(() => stats.value.uploadableSkips)
 
 const progressPercent = computed(() => {
   if (runTotal.value === 0) return 0
-  return Math.round((runFinished.value / runTotal.value) * 100)
+  return Math.round((runProcessed.value / runTotal.value) * 100)
 })
 
 const filter = ref<Filter>('all')
@@ -201,14 +207,22 @@ const etaDisplay = computed(() => {
   return `${formatEta(etaSeconds.value)} left`
 })
 
+// Cancelled files leave the byte total, so once the run is over only the
+// uploaded amount is shown, not a misleading "x of x".
 const bytesDisplay = computed(() => {
   if (state.totalBytes === 0) return ''
+  if (!state.isUploading) return `${formatBytes(state.uploadedBytes)} uploaded`
   return `${formatBytes(state.uploadedBytes)} / ${formatBytes(state.totalBytes)}`
 })
 
-const albumProgressPercent = computed(() => {
-  if (!state.albumStatus || state.albumStatus.TotalItems === 0) return 0
-  return Math.round((state.albumStatus.ItemsAdded / state.albumStatus.TotalItems) * 100)
+const albumsBusy = computed(() => state.albums.filter(album => album.state === 'waiting' || album.state === 'adding').length)
+const albumsDone = computed(() => state.albums.filter(album => album.state === 'done').length)
+const albumsFailed = computed(() => state.albums.filter(album => album.state === 'failed').length)
+const albumTitle = computed(() => {
+  const count = state.albums.length
+  if (albumsBusy.value) return `Adding to albums… ${albumsDone.value} of ${count} done`
+  if (albumsFailed.value) return `${albumsDone.value} album(s) updated, ${albumsFailed.value} failed`
+  return count === 1 ? 'Album updated' : `All ${count} albums updated`
 })
 
 const hasPendingUploads = computed(() => counts.value.queued > 0 || counts.value.active > 0)
@@ -245,12 +259,12 @@ const rateLimitSeconds = computed(() => {
 })
 
 const statusLabel = computed(() => {
-  if (!state.isUploading) return 'Finished'
+  if (!state.isUploading) return runCancelled.value > 0 ? 'Stopped' : 'Finished'
   if (state.queueStatus.StoppedReason) return 'Stopped'
   if (state.queueStatus.WaitingForNetwork) return 'Waiting for connection'
   if (state.queueStatus.RateLimitedUntil > 0) return `Rate limited by Google, resuming in ${formatDuration(rateLimitSeconds.value)}`
   if (state.queueStatus.Paused) return counts.value.active > 0 ? 'Pausing after current items' : 'Paused'
-  if (!hasPendingUploads.value && state.isCreatingAlbum) return 'Adding to album'
+  if (!hasPendingUploads.value && state.isCreatingAlbum) return 'Adding to albums'
   if (!hasPendingUploads.value && scanLabel.value) return 'Scanning'
   if (!hasPendingUploads.value) return 'Finishing'
   return 'Uploading'
@@ -296,14 +310,16 @@ async function copyResults() {
         </SheetContent>
       </Sheet>
       <p class="text-2xl font-bold tabular-nums">
-        {{ runFinished }}<span class="text-muted-foreground font-normal">/</span><span class="text-muted-foreground">{{ runTotal }}</span>
+        {{ runProcessed.toLocaleString() }}<span class="text-muted-foreground font-normal">/</span><span class="text-muted-foreground">{{ runTotal.toLocaleString() }}</span>
       </p>
       <p class="text-xs text-muted-foreground flex items-center justify-center gap-1.5">
         <WifiOff
           v-if="state.queueStatus.WaitingForNetwork"
           :size="12"
         />
-        {{ statusLabel }}
+        {{ statusLabel }}<template v-if="runCancelled">
+          · {{ runCancelled.toLocaleString() }} cancelled
+        </template>
       </p>
     </div>
 
@@ -438,28 +454,54 @@ async function copyResults() {
       </p>
     </div>
 
-    <!-- Album creation progress -->
+    <!-- Albums this run adds to -->
     <div
-      v-if="state.albumStatus && (state.isCreatingAlbum || state.albumStatus.IsComplete)"
+      v-if="state.albums.length"
       class="p-3 rounded-lg border bg-muted/30"
     >
-      <div class="flex items-center gap-2 mb-2">
-        <FolderPlus
+      <div class="flex items-center gap-2">
+        <Loader2
+          v-if="albumsBusy"
+          :size="14"
+          class="text-primary animate-spin"
+        />
+        <AlertTriangle
+          v-else-if="albumsFailed"
+          :size="14"
+          class="text-destructive"
+        />
+        <CheckCircle2
+          v-else
           :size="14"
           class="text-primary"
         />
-        <span class="text-sm font-medium">
-          {{ state.isCreatingAlbum ? 'Adding to album...' : 'Added to album' }}
-        </span>
-        <span class="ml-auto text-xs text-muted-foreground truncate">{{ state.albumStatus.AlbumName }}</span>
+        <span class="text-sm font-medium">{{ albumTitle }}</span>
       </div>
-      <Progress
-        :model-value="albumProgressPercent"
-        class="h-1.5"
-      />
-      <p class="text-xs text-muted-foreground mt-1">
-        {{ state.albumStatus.ItemsAdded }} / {{ state.albumStatus.TotalItems }} items
-      </p>
+      <ul class="mt-2 max-h-32 overflow-y-auto space-y-1">
+        <li
+          v-for="album in state.albums"
+          :key="album.name"
+          class="flex items-center gap-2 text-xs"
+          :title="album.error || undefined"
+        >
+          <span class="min-w-0 flex-1 truncate">{{ album.name }}</span>
+          <span
+            :class="[
+              'shrink-0 tabular-nums',
+              album.state === 'failed' ? 'text-destructive' : 'text-muted-foreground'
+            ]"
+          >
+            <template v-if="album.state === 'waiting'">waiting</template>
+            <template v-else-if="album.state === 'failed'">failed</template>
+            <template v-else>{{ album.added.toLocaleString() }} / {{ album.total.toLocaleString() }}</template>
+          </span>
+          <Check
+            v-if="album.state === 'done'"
+            :size="12"
+            class="shrink-0 text-primary"
+          />
+        </li>
+      </ul>
     </div>
 
     <!-- Warnings, collapsed by default -->

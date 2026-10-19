@@ -94,6 +94,15 @@ const idleQueueStatus = (): QueueStatus => ({
   Scan: { Phase: "", Found: 0, Checked: 0, Total: 0 },
 });
 
+// One album this run adds to, and how far it got.
+export interface AlbumEntry {
+  name: string;
+  added: number;
+  total: number;
+  state: "waiting" | "adding" | "done" | "failed";
+  error: string;
+}
+
 export interface UploadState {
   isUploading: boolean;
   // Every item since the list was last cleared, in queue order.
@@ -115,6 +124,8 @@ export interface UploadState {
   // Album creation
   albumStatus: AlbumStatus | null;
   isCreatingAlbum: boolean;
+  // Every album of this run, in the order they were started.
+  albums: AlbumEntry[];
 }
 
 class UploadManager {
@@ -142,6 +153,7 @@ class UploadManager {
     uploadSpeed: 0,
     albumStatus: null,
     isCreatingAlbum: false,
+    albums: [],
   });
 
   // For speed calculation
@@ -189,6 +201,7 @@ class UploadManager {
         this.state.startTime = Date.now();
         this.state.uploadSpeed = 0;
         this.state.albumStatus = null;
+        this.state.albums = [];
         this.state.queueStatus = idleQueueStatus();
         this.lastSpeedUpdate = Date.now();
         this.lastBytesUploaded = 0;
@@ -302,21 +315,36 @@ class UploadManager {
       this.state.isUploading = false;
     });
 
-    // Handle album creation progress
+    // Album progress: an album is announced with nothing added while existing
+    // albums are looked up, then reports each batch added.
     Events.On("albumProgress", (event: { data: AlbumStatus }) => {
       this.state.albumStatus = event.data;
-      this.state.isCreatingAlbum = true;
+      const entry = this.albumEntry(event.data.AlbumName, event.data.TotalItems);
+      entry.added = event.data.ItemsAdded;
+      entry.total = event.data.TotalItems || entry.total;
+      entry.state = event.data.ItemsAdded > 0 ? "adding" : "waiting";
+      this.updateAlbumFlag();
     });
 
-    // Handle album creation complete
+    // An album is complete. Albums split at the item limit report progress as
+    // "Name (1)", "Name (2)" but complete under "Name", so finish those too.
     Events.On("albumComplete", (event: { data: AlbumStatus }) => {
       this.state.albumStatus = event.data;
-      this.state.isCreatingAlbum = false;
+      const name = event.data.AlbumName;
+      const parts = this.state.albums.filter(album => album.name === name || album.name.startsWith(`${name} (`));
+      if (!parts.length) parts.push(this.albumEntry(name, event.data.TotalItems));
+      for (const album of parts) {
+        album.state = "done";
+        album.added = album.total;
+      }
+      this.updateAlbumFlag();
     });
 
-    // Handle album creation error
     Events.On("albumError", (event: { data: AlbumError }) => {
-      this.state.isCreatingAlbum = false;
+      const entry = this.albumEntry(event.data.AlbumName, 0);
+      entry.state = "failed";
+      entry.error = event.data.Error;
+      this.updateAlbumFlag();
       // Emit a custom event that App.vue can listen to for showing toast
       window.dispatchEvent(new CustomEvent('albumError', { detail: event.data }));
     });
@@ -368,6 +396,19 @@ class UploadManager {
     this.state.results.warnings = [];
   }
 
+  private albumEntry(name: string, total: number): AlbumEntry {
+    let entry = this.state.albums.find(album => album.name === name);
+    if (!entry) {
+      this.state.albums.push({ name, added: 0, total, state: "waiting", error: "" });
+      entry = this.state.albums[this.state.albums.length - 1];
+    }
+    return entry;
+  }
+
+  private updateAlbumFlag() {
+    this.state.isCreatingAlbum = this.state.albums.some(album => album.state === "waiting" || album.state === "adding");
+  }
+
   private insertItem(item: QueueItem) {
     this.itemIndex.set(item.ID, this.state.items.length);
     // Items are replaced, never mutated, so deep reactivity on thousands of
@@ -414,6 +455,7 @@ class UploadManager {
       this.state.uploadedFiles = 0;
       this.state.totalFiles = 0;
       this.state.albumStatus = null;
+      this.state.albums = [];
     }
   }
 

@@ -1250,22 +1250,40 @@ func (m *UploadManager) handleAlbumCreation(ctx context.Context, opts UploadOpti
 		return
 	}
 	albumManager := NewAlbumManager(api, m.reporter, m.logger, ctx.Done())
-	existing := m.existingAlbums(ctx, opts.Api)
 
+	type target struct {
+		cacheKey, name string
+		mediaKeys      []string
+	}
+	var targets []target
 	if opts.AlbumAutoMode {
 		for _, group := range groupUploadsByFolder(uploads) {
-			m.addToSessionAlbum(albumManager, existing, "dir:"+group.dir, group.name, group.mediaKeys)
+			targets = append(targets, target{"dir:" + group.dir, group.name, group.mediaKeys})
 		}
-		return
+	} else if opts.AlbumName != "" {
+		mediaKeys := make([]string, 0, len(uploads))
+		for _, upload := range uploads {
+			mediaKeys = append(mediaKeys, upload.mediaKey)
+		}
+		targets = append(targets, target{"name:" + opts.AlbumName, opts.AlbumName, mediaKeys})
 	}
-	if opts.AlbumName == "" {
-		return
+	// Announce every album first: looking up existing albums can take a
+	// while, and the app should show what is waiting rather than nothing.
+	for _, t := range targets {
+		m.reporter.AlbumProgress(AlbumStatus{AlbumName: albumDisplayName(t.name), TotalItems: len(t.mediaKeys)})
 	}
-	mediaKeys := make([]string, 0, len(uploads))
-	for _, upload := range uploads {
-		mediaKeys = append(mediaKeys, upload.mediaKey)
+	existing := m.existingAlbums(ctx, opts.Api)
+	for _, t := range targets {
+		m.addToSessionAlbum(albumManager, existing, t.cacheKey, t.name, t.mediaKeys)
 	}
-	m.addToSessionAlbum(albumManager, existing, "name:"+opts.AlbumName, opts.AlbumName, mediaKeys)
+}
+
+// albumDisplayName is the name album events use for nameOrKey.
+func albumDisplayName(nameOrKey string) string {
+	if IsAlbumKey(nameOrKey) {
+		return albumKeyDisplayName(nameOrKey)
+	}
+	return nameOrKey
 }
 
 // addToSessionAlbum adds media to an album named nameOrKey without creating
@@ -1311,7 +1329,7 @@ func (m *UploadManager) addToSessionAlbum(albumManager *AlbumManager, existing *
 	}
 	if err != nil {
 		m.logger.Error("album update failed", "album", nameOrKey, "error", err)
-		m.reporter.AlbumError(AlbumError{AlbumName: nameOrKey, Error: err.Error()})
+		m.reporter.AlbumError(AlbumError{AlbumName: albumDisplayName(nameOrKey), Error: err.Error()})
 		return
 	}
 	m.logger.Info("album updated", "album", nameOrKey, "items", len(mediaKeys), "albumKeys", albumKeys)
