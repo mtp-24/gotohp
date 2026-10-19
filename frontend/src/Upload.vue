@@ -119,14 +119,23 @@ const filteredItems = computed<QueueItem[]>(() => {
 })
 // Queued and Active are in upload order, so the next file is on top and
 // files leave as they move on. The other tabs grow as files finish, so they
-// show the most recently changed first: new results appear on top.
+// show the most recently changed first: new results appear on top. All pins
+// the files uploading now above the latest results.
 const uploadOrderFilters: Filter[] = ['queued', 'active']
 const visibleItems = computed(() => {
   void state.listVersion
+  const limit = visibleCount.value
   if (uploadOrderFilters.includes(filter.value)) {
-    return filteredItems.value.slice(0, visibleCount.value)
+    return filteredItems.value.slice(0, limit)
   }
-  return newestFirst(filteredItems.value, visibleCount.value)
+  if (filter.value !== 'all') {
+    return newestFirst(filteredItems.value, limit)
+  }
+  // Active files are few (one per upload thread); take a few extra newest
+  // items so the page stays full once they are moved to the top.
+  const active = state.items.filter(item => item.State === 'active')
+  const rest = newestFirst(state.items, limit + active.length).filter(item => item.State !== 'active')
+  return [...active, ...rest].slice(0, limit)
 })
 
 function setFilter(value: Filter) {
