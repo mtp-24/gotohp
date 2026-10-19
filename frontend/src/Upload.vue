@@ -122,23 +122,43 @@ const filteredItems = computed<QueueItem[]>(() => {
 })
 // Queued and Active are in upload order, so the next file is on top and
 // files leave as they move on. The other tabs grow as files finish, so they
-// show the most recently changed first: new results appear on top. All pins
-// the files uploading now above the latest results.
+// show the most recently changed first: new results appear on top. All is an
+// overview in sections instead of one list (see overview below).
 const uploadOrderFilters: Filter[] = ['queued', 'active']
 const visibleItems = computed(() => {
   void state.listVersion
+  if (filter.value === 'all') return []
   const limit = visibleCount.value
   if (uploadOrderFilters.includes(filter.value)) {
     return filteredItems.value.slice(0, limit)
   }
-  if (filter.value !== 'all') {
-    return newestFirst(filteredItems.value, limit)
+  return newestFirst(filteredItems.value, limit)
+})
+
+// The All tab shows a few rows of each kind, each section linking to its full
+// tab: what needs attention, what is next and the latest results. It is at
+// most a few dozen rows however long the queue is.
+const overviewFailed = 5
+const overviewNext = 5
+const overviewFinished = 20
+const overview = computed(() => {
+  void state.listVersion
+  if (filter.value !== 'all') return null
+  const failed: QueueItem[] = []
+  const next: QueueItem[] = []
+  const finished: QueueItem[] = []
+  for (const item of state.items) {
+    if (item.State === 'failed') failed.push(item)
+    else if (item.State === 'done' || item.State === 'skipped') finished.push(item)
+    // The list is in upload order, so the first queued items go next.
+    else if (item.State === 'queued' && next.length < overviewNext) next.push(item)
   }
-  // Active files are few (one per upload thread); take a few extra newest
-  // items so the page stays full once they are moved to the top.
-  const active = state.items.filter(item => item.State === 'active')
-  const rest = newestFirst(state.items, limit + active.length).filter(item => item.State !== 'active')
-  return [...active, ...rest].slice(0, limit)
+  return {
+    failed: newestFirst(failed, overviewFailed),
+    next,
+    finished: newestFirst(finished, overviewFinished),
+    finishedCount: finished.length,
+  }
 })
 
 function setFilter(value: Filter) {
@@ -610,9 +630,9 @@ async function copyResults() {
       </div>
     </div>
 
-    <!-- Active uploads with live progress -->
+    <!-- Active uploads with live progress; the All tab shows them in its list. -->
     <div
-      v-if="threadsList.length"
+      v-if="threadsList.length && filter !== 'all'"
       class="space-y-1.5 max-h-48 overflow-y-auto"
     >
       <ThreadProgress
@@ -640,7 +660,134 @@ async function copyResults() {
     <!-- Item list -->
     <div class="flex-1 min-h-0">
       <ScrollArea class="h-full">
-        <div class="space-y-1 pr-3">
+        <div
+          v-if="overview"
+          class="space-y-1 pr-3"
+        >
+          <template v-if="threadsList.length">
+            <div class="flex items-baseline gap-1.5 px-0.5 pt-1">
+              <h3 class="text-[11px] font-semibold uppercase tracking-wide">
+                Uploading now
+              </h3>
+              <span class="text-[11px] text-muted-foreground tabular-nums">{{ counts.active.toLocaleString() }}</span>
+              <button
+                class="ml-auto text-[11px] text-muted-foreground hover:text-foreground cursor-pointer"
+                @click="setFilter('active')"
+              >
+                Active ›
+              </button>
+            </div>
+            <ThreadProgress
+              v-for="thread in threadsList"
+              :key="thread.WorkerID"
+              :thread="thread"
+            />
+          </template>
+
+          <template v-if="overview.failed.length">
+            <div class="flex items-baseline gap-1.5 px-0.5 pt-2">
+              <h3 class="text-[11px] font-semibold uppercase tracking-wide text-destructive">
+                Needs attention
+              </h3>
+              <span class="text-[11px] text-muted-foreground tabular-nums">{{ counts.failed.toLocaleString() }}</span>
+              <button
+                class="ml-auto flex items-center gap-1 text-[11px] font-medium hover:underline cursor-pointer"
+                @click="uploadManager.retryFailed()"
+              >
+                <RotateCcw :size="11" />
+                Retry all
+              </button>
+            </div>
+            <QueueItemRow
+              v-for="item in overview.failed"
+              :key="item.ID"
+              :item="item"
+              @retry="uploadManager.retryItem(item.ID)"
+            />
+            <button
+              v-if="counts.failed > overview.failed.length"
+              class="w-full py-0.5 text-center text-[11px] text-muted-foreground hover:text-foreground cursor-pointer"
+              @click="setFilter('failed')"
+            >
+              <span class="font-medium text-foreground">+{{ (counts.failed - overview.failed.length).toLocaleString() }} more</span> in Failed
+            </button>
+          </template>
+
+          <template v-if="overview.next.length">
+            <div class="flex items-baseline gap-1.5 px-0.5 pt-2">
+              <h3 class="text-[11px] font-semibold uppercase tracking-wide">
+                Up next
+              </h3>
+              <span class="text-[11px] text-muted-foreground tabular-nums">{{ counts.queued.toLocaleString() }}</span>
+              <button
+                class="ml-auto text-[11px] text-muted-foreground hover:text-foreground cursor-pointer"
+                @click="setFilter('queued')"
+              >
+                Queued ›
+              </button>
+            </div>
+            <QueueItemRow
+              v-for="item in overview.next"
+              :key="item.ID"
+              :item="item"
+              @cancel="uploadManager.cancelItem(item.ID)"
+            />
+            <button
+              v-if="counts.queued > overview.next.length"
+              class="w-full py-0.5 text-center text-[11px] text-muted-foreground hover:text-foreground cursor-pointer"
+              @click="setFilter('queued')"
+            >
+              <span class="font-medium text-foreground">+{{ (counts.queued - overview.next.length).toLocaleString() }} more</span> in Queued
+            </button>
+          </template>
+
+          <template v-if="overview.finished.length">
+            <div class="flex items-baseline gap-1.5 px-0.5 pt-2">
+              <h3 class="text-[11px] font-semibold uppercase tracking-wide">
+                Recently finished
+              </h3>
+              <span class="text-[11px] text-muted-foreground tabular-nums">{{ overview.finishedCount.toLocaleString() }}</span>
+              <button
+                class="ml-auto text-[11px] text-muted-foreground hover:text-foreground cursor-pointer"
+                @click="setFilter(counts.done ? 'done' : 'skipped')"
+              >
+                {{ counts.done ? 'Done' : 'Skipped' }} ›
+              </button>
+            </div>
+            <QueueItemRow
+              v-for="item in overview.finished"
+              :key="item.ID"
+              :item="item"
+            />
+            <button
+              v-if="overview.finishedCount > overview.finished.length"
+              class="w-full py-0.5 text-center text-[11px] text-muted-foreground hover:text-foreground cursor-pointer"
+              @click="setFilter(counts.done ? 'done' : 'skipped')"
+            >
+              Older results are in Done<template v-if="counts.skipped">
+                and Skipped
+              </template>
+            </button>
+          </template>
+
+          <button
+            v-if="counts.cancelled"
+            class="w-full py-1 text-center text-[11px] text-muted-foreground hover:text-foreground cursor-pointer"
+            @click="setFilter('cancelled')"
+          >
+            {{ counts.cancelled.toLocaleString() }} cancelled ›
+          </button>
+          <p
+            v-if="state.items.length === 0 && !threadsList.length"
+            class="py-6 text-center text-xs text-muted-foreground"
+          >
+            {{ state.isUploading ? 'Scanning files...' : 'No items' }}
+          </p>
+        </div>
+        <div
+          v-else
+          class="space-y-1 pr-3"
+        >
           <QueueItemRow
             v-for="item in visibleItems"
             :key="item.ID"
