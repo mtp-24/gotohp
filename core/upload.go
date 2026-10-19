@@ -298,6 +298,29 @@ func uploadSingleFile(ctx context.Context, api *Api, filePath string, opts Uploa
 
 	sha1_hash_b64 := base64.StdEncoding.EncodeToString([]byte(sha1_hash_bytes))
 
+	// An identical file earlier in this session, from another folder, is
+	// reused instead of uploaded again; one still uploading is waited for.
+	if memo := hashMemoFrom(ctx); memo != nil {
+		known, claimed, err := memo.begin(ctx, sha1_hash_b64)
+		if err != nil {
+			return "", false, err
+		}
+		if known != "" {
+			reporter.ThreadStatus(ThreadStatus{
+				WorkerID: workerID,
+				Status:   "completed",
+				FilePath: filePath,
+				FileName: fileName,
+				Message:  "Same file as one already uploaded",
+			})
+			reporter.TotalBytesDelta(-initialSize)
+			return known, true, nil
+		}
+		if claimed {
+			defer func() { memo.end(sha1_hash_b64, mediaKey) }()
+		}
+	}
+
 	// Stage 2: Checking if exists in library
 	if !opts.ForceUpload {
 		reporter.ThreadStatus(ThreadStatus{
@@ -310,14 +333,10 @@ func uploadSingleFile(ctx context.Context, api *Api, filePath string, opts Uploa
 
 		mediakey, err = api.FindRemoteMediaByHash(sha1_hash_bytes)
 		if err != nil {
-			// Non-fatal: log via callback and continue with upload
-			reporter.ThreadStatus(ThreadStatus{
-				WorkerID: workerID,
-				Status:   "checking",
-				FilePath: filePath,
-				FileName: fileName,
-				Message:  fmt.Sprintf("Hash check warning: %v, proceeding with upload", err),
-			})
+			// Never upload without knowing: Google stores an identical file as
+			// a second item. A rate limit or lost connection puts the file back
+			// in the queue to retry; anything else fails visibly.
+			return "", false, fmt.Errorf("check whether the file is already in the library: %w", err)
 		}
 		if len(mediakey) > 0 {
 			reporter.ThreadStatus(ThreadStatus{

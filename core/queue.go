@@ -165,7 +165,10 @@ type UploadManager struct {
 	// the setting applies to the queue that is already running.
 	threadLimit int
 	// itemPaths counts known items per file path, for HasItemPath.
-	itemPaths  map[string]int
+	itemPaths map[string]int
+	// hashes remembers uploaded fingerprints for the session, so identical
+	// files from different folders upload once.
+	hashes     *hashMemo
 	scans      map[*uploadBatch]struct{}
 	lastScanAt time.Time
 
@@ -212,6 +215,7 @@ func NewUploadManager(reporter UploadReporter, logger *slog.Logger) *UploadManag
 		items:         make(map[int64]*queueEntry),
 		inQueue:       make(map[string]*queueEntry),
 		itemPaths:     make(map[string]int),
+		hashes:        newHashMemo(),
 		scans:         make(map[*uploadBatch]struct{}),
 		albumKeys:     make(map[string]string),
 		albumLists:    make(map[string]*albumList),
@@ -916,7 +920,7 @@ func (m *UploadManager) nextItem(workerID int) (*queueEntry, context.Context, Qu
 			m.pending = m.pending[1:]
 			entry.item.State = QueueItemActive
 			entry.item.Message = ""
-			ctx, cancel := context.WithCancel(entry.batch.ctx)
+			ctx, cancel := context.WithCancel(withHashMemo(entry.batch.ctx, m.hashes))
 			entry.cancel = cancel
 			return entry, ctx, entry.item
 		}
