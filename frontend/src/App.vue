@@ -34,7 +34,7 @@ const isDraggingFiles = ref(false)
 // Album upload flow state
 const showAlbumInput = ref(false)
 // The upload list stays up after a run until the user clears it.
-const showQueue = computed(() => uploadState.isUploading || uploadState.items.length > 0)
+const showQueue = computed(() => uploadState.isUploading || uploadState.itemCount > 0)
 const pendingFiles = ref<string[]>([])
 const pendingFileCount = ref(0)
 

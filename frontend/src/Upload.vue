@@ -6,6 +6,7 @@ import { ScrollArea } from "./components/ui/scroll-area"
 import ThreadProgress from "./components/ThreadProgress.vue"
 import QueueItemRow from "./components/QueueItemRow.vue"
 import { uploadManager, type QueueItem, type QueueItemState } from './utils/UploadManager'
+import { newestFirst } from './utils/newestFirst'
 import { Sheet, SheetContent, SheetTrigger } from './components/ui/sheet'
 import { TooltipProvider } from './components/ui/tooltip'
 import SettingsPanel from './SettingsPanel.vue'
@@ -56,6 +57,8 @@ type Filter = 'all' | QueueItemState
 // Every list statistic in one pass: with tens of thousands of items, a pass
 // per statistic made each update noticeably slow.
 const stats = computed(() => {
+  // The list is not reactive; listVersion marks when it changed.
+  void state.listVersion
   const counts: Record<Filter, number> = { all: state.items.length, queued: 0, active: 0, done: 0, failed: 0, skipped: 0, cancelled: 0 }
   let runTotal = 0
   let runFinished = 0
@@ -110,10 +113,16 @@ const filters: { value: Filter; label: string }[] = [
 const pageSize = 200
 const visibleCount = ref(pageSize)
 const filteredItems = computed<QueueItem[]>(() => {
+  void state.listVersion
   if (filter.value === 'all') return state.items
   return state.items.filter(item => item.State === filter.value)
 })
-const visibleItems = computed(() => filteredItems.value.slice(0, visibleCount.value))
+// Most recently changed first: what just started, finished or failed is on
+// top, and queued files follow, newest drop first.
+const visibleItems = computed(() => {
+  void state.listVersion
+  return newestFirst(filteredItems.value, visibleCount.value)
+})
 
 function setFilter(value: Filter) {
   filter.value = value

@@ -1,5 +1,5 @@
 import { Clipboard, Events } from "@wailsio/runtime";
-import { markRaw, reactive, toRaw } from "vue";
+import { markRaw, reactive } from "vue";
 import {
   recordUploadResult,
   type UploadResults,
@@ -73,6 +73,9 @@ export interface QueueItem {
   SkipCode: string;
   // Frontend-only: the run the item last joined, for per-run progress.
   runId: number;
+  // Frontend-only: rises each time the item is added or changes, so the list
+  // can show the most recently changed items first.
+  seq: number;
 }
 
 export interface QueueStatus {
@@ -105,8 +108,14 @@ export interface AlbumEntry {
 
 export interface UploadState {
   isUploading: boolean;
-  // Every item since the list was last cleared, in queue order.
+  // Every item since the list was last cleared, in queue order. The array is
+  // not reactive: with tens of thousands of items, re-rendering on every
+  // change would cost too much. Read it together with listVersion, which
+  // rises at most a few times a second after changes.
   items: QueueItem[];
+  listVersion: number;
+  // items.length as of the last listVersion.
+  itemCount: number;
   runId: number;
   queueStatus: QueueStatus;
   totalFiles: number;
@@ -134,7 +143,9 @@ class UploadManager {
   // Reactive state that can be accessed by components
   public state = reactive<UploadState>({
     isUploading: false,
-    items: [],
+    items: markRaw([]) as QueueItem[],
+    listVersion: 0,
+    itemCount: 0,
     runId: 0,
     queueStatus: idleQueueStatus(),
     totalFiles: 0,
@@ -166,6 +177,11 @@ class UploadManager {
   private fileBytes: Map<string, number> = new Map();
   // Dedupe decisions can change the bytes that will actually be uploaded.
   private totalBytesAdjustment: number = 0;
+  // Last value handed out as an item's seq.
+  private seq = 0;
+  // Throttles list refreshes; see refreshList.
+  private listTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastListRefresh = 0;
   // Index into state.items by item ID.
   private itemIndex: Map<number, number> = new Map();
 
@@ -223,14 +239,9 @@ class UploadManager {
     });
 
     // Changes made together (e.g. cancelling thousands of queued items)
-    // arrive as one event and are applied in one pass, so the list renders
-    // once instead of once per item.
+    // arrive as one event and are applied in one pass.
     Events.On("queueItemsUpdated", (event: { data: QueueItem[] }) => {
-      // For big batches, edit a plain copy and swap it in once: setting
-      // thousands of entries on the reactive array one by one is far slower.
-      // Small batches, the common case, are cheaper to apply in place.
-      const bulk = event.data.length > 100;
-      const items = bulk ? toRaw(this.state.items).slice() : this.state.items;
+      const items = this.state.items;
       const added: QueueItem[] = [];
       for (const update of event.data) {
         const index = this.itemIndex.get(update.ID);
@@ -241,14 +252,12 @@ class UploadManager {
         const runId = update.State === "queued" || update.State === "active"
           ? this.state.runId
           : items[index].runId;
-        items[index] = markRaw({ ...update, runId });
-      }
-      if (bulk) {
-        this.state.items = items;
+        items[index] = markRaw({ ...update, runId, seq: ++this.seq });
       }
       for (const item of added) {
         this.insertItem(item);
       }
+      this.refreshList();
     });
 
     Events.On("queueStatus", (event: { data: QueueStatus }) => {
@@ -411,9 +420,22 @@ class UploadManager {
 
   private insertItem(item: QueueItem) {
     this.itemIndex.set(item.ID, this.state.items.length);
-    // Items are replaced, never mutated, so deep reactivity on thousands of
-    // them would only cost memory and time.
-    this.state.items.push(markRaw({ ...item, runId: this.state.runId }));
+    // Items are replaced, never mutated, so they need no reactivity either.
+    this.state.items.push(markRaw({ ...item, runId: this.state.runId, seq: ++this.seq }));
+    this.refreshList();
+  }
+
+  // refreshList tells the page the list changed: at once after a quiet spell,
+  // otherwise at most every 250 ms, however many items changed meanwhile.
+  private refreshList() {
+    if (this.listTimer) return;
+    const wait = Math.max(0, 250 - (Date.now() - this.lastListRefresh));
+    this.listTimer = setTimeout(() => {
+      this.listTimer = null;
+      this.lastListRefresh = Date.now();
+      this.state.itemCount = this.state.items.length;
+      this.state.listVersion++;
+    }, wait);
   }
 
   public cancelUpload() {
@@ -447,8 +469,9 @@ class UploadManager {
   public clearFinished() {
     Events.Emit("uploadClearFinished");
     const remaining = this.state.items.filter(item => item.State === "queued" || item.State === "active");
-    this.state.items = remaining;
+    this.state.items = markRaw(remaining);
     this.itemIndex = new Map(remaining.map((item, index) => [item.ID, index]));
+    this.refreshList();
     this.resetUploadResults();
     this.state.warnings = [];
     if (!this.state.isUploading) {
