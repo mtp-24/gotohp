@@ -32,6 +32,7 @@ declare module "@wailsio/runtime" {
             "uploadSkipped": void;
             "uploadStart": core$0.UploadBatchStart;
             "uploadStop": void;
+            "uploadThreads": number;
             "uploadTotalBytes": number;
             "uploadTotalBytesDelta": number;
             "uploadWarning": core$0.PreflightWarning;

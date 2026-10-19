@@ -107,6 +107,11 @@ func runGUI() {
 			uploadManager.RetryItem(id)
 		}
 	})
+	wailsApp.Event.On("uploadThreads", func(e *application.CustomEvent) {
+		if threads, ok := e.Data.(int); ok {
+			uploadManager.SetThreads(threads)
+		}
+	})
 	wailsApp.Event.On("uploadRetryFailed", func(e *application.CustomEvent) {
 		uploadManager.RetryFailed()
 	})

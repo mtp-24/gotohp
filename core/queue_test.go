@@ -819,3 +819,34 @@ func TestQueueCreatesAlbumWhenListingFails(t *testing.T) {
 		t.Fatal("no warning that existing albums could not be checked")
 	}
 }
+
+func TestQueueThreadChangesApplyToTheRunningQueue(t *testing.T) {
+	m, rec, up, _ := newTestQueue(t)
+	names := []string{"a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"}
+	m.Upload(writeMedia(t, t.TempDir(), names...), testOpts(1))
+	first := <-up.started
+
+	// Raising the limit starts two more workers on queued files at once.
+	m.SetThreads(3)
+	second, third := <-up.started, <-up.started
+	up.assertNothingStarts(t)
+
+	// Lowering it lets the three running files finish, then only one worker
+	// continues.
+	m.SetThreads(1)
+	for _, name := range []string{first, second, third} {
+		up.gate(name) <- nil
+	}
+	fourth := <-up.started
+	up.assertNothingStarts(t)
+	up.gate(fourth) <- nil
+	fifth := <-up.started
+	up.gate(fifth) <- nil
+	rec.waitStop(t)
+
+	for _, name := range names {
+		if got := rec.itemByName(name).State; got != QueueItemDone {
+			t.Errorf("%s state = %q, want done", name, got)
+		}
+	}
+}

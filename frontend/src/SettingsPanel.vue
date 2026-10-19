@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { nextTick, ref, onMounted, watch } from 'vue'
 import { ConfigManager } from '../bindings/app/core'
+import { Events } from '@wailsio/runtime'
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
@@ -147,6 +148,8 @@ watch(() => settings.value.uploadThreads, async (newValue) => {
         settings.value.uploadThreads = 1
     } else {
         await ConfigManager.SetUploadThreads(newValue)
+        // Apply to the queue that is already running, not just new drops.
+        await Events.Emit('uploadThreads', newValue)
     }
 })
 </script>

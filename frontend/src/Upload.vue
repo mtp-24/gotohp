@@ -302,7 +302,7 @@ async function copyResults() {
         </SheetTrigger>
         <SheetContent side="bottom">
           <p class="px-4 pt-4 text-xs text-muted-foreground">
-            Changes apply to files you add from now on. Items already in the queue keep the settings they were added with.
+            Upload threads apply right away. Other changes apply to files you add from now on; items already in the queue keep the settings they were added with.
           </p>
           <TooltipProvider disable-hoverable-content>
             <SettingsPanel />

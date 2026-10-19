@@ -26,6 +26,7 @@ func init() {
 	application.RegisterEvent[[]core.QueueItem]("queueItemsUpdated")
 	application.RegisterEvent[core.QueueStatus]("queueStatus")
 	application.RegisterEvent[bool]("uploadPause")
+	application.RegisterEvent[int]("uploadThreads")
 	application.RegisterEvent[int64]("uploadCancelItem")
 	application.RegisterEvent[int64]("uploadRetryItem")
 	application.RegisterEvent[application.Void]("uploadRetryFailed")

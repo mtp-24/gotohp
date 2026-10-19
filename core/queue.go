@@ -161,6 +161,9 @@ type UploadManager struct {
 	pending     []*queueEntry
 	inQueue     map[string]*queueEntry
 	workerSlots []bool
+	// threadLimit, when set, replaces each drop's thread count, so changing
+	// the setting applies to the queue that is already running.
+	threadLimit int
 	// itemPaths counts known items per file path, for HasItemPath.
 	itemPaths  map[string]int
 	scans      map[*uploadBatch]struct{}
@@ -837,15 +840,34 @@ func (m *UploadManager) scanFinished(batch *uploadBatch) {
 	}
 }
 
-// spawnWorkersLocked starts workers until there are threads of them or one
-// per queued item.
-func (m *UploadManager) spawnWorkersLocked(threads int) {
+// SetThreads changes how many files upload at once, right away: more workers
+// start on queued files, or surplus workers stop after their current file.
+// Nothing in progress is interrupted.
+func (m *UploadManager) SetThreads(threads int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.threadLimit = max(1, threads)
+	m.spawnWorkersLocked(m.threadLimit)
+	m.cond.Broadcast()
+}
+
+func (m *UploadManager) liveWorkersLocked() int {
 	live := 0
 	for _, used := range m.workerSlots {
 		if used {
 			live++
 		}
 	}
+	return live
+}
+
+// spawnWorkersLocked starts workers until there are threads of them, or the
+// live thread limit when one is set, or one per queued item.
+func (m *UploadManager) spawnWorkersLocked(threads int) {
+	if m.threadLimit > 0 {
+		threads = m.threadLimit
+	}
+	live := m.liveWorkersLocked()
 	for live < threads && live < len(m.pending)+m.activeCountLocked() {
 		id := slices.Index(m.workerSlots, false)
 		if id < 0 {
@@ -875,12 +897,18 @@ func (m *UploadManager) anyActiveLocked() bool {
 }
 
 // nextItem blocks until an item can start, or returns nil when the worker
-// should exit because the queue drained or the run was cancelled.
-func (m *UploadManager) nextItem() (*queueEntry, context.Context, QueueItem) {
+// should exit because the queue drained, the run was cancelled, or the thread
+// limit was lowered below the number of workers.
+func (m *UploadManager) nextItem(workerID int) (*queueEntry, context.Context, QueueItem) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for {
 		if m.runCtx.Err() != nil {
+			return nil, nil, QueueItem{}
+		}
+		if m.threadLimit > 0 && m.liveWorkersLocked() > m.threadLimit {
+			// Free the slot now, so other workers count one fewer at once.
+			m.workerSlots[workerID] = false
 			return nil, nil, QueueItem{}
 		}
 		if !m.paused && !m.waitingForNetwork && m.rateLimitedUntil.IsZero() && len(m.pending) > 0 {
@@ -910,7 +938,7 @@ func (m *UploadManager) runWorker(workerID int) {
 
 	apis := make(map[ApiOptions]*Api)
 	for {
-		entry, ctx, item := m.nextItem()
+		entry, ctx, item := m.nextItem(workerID)
 		if entry == nil {
 			break
 		}
