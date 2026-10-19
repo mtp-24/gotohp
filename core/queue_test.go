@@ -106,6 +106,8 @@ type fakeUploads struct {
 	started  chan string
 	release  map[string]chan error
 	attempts map[string]int
+	// inLibrary names files the fake library already holds.
+	inLibrary map[string]bool
 }
 
 func newFakeUploads() *fakeUploads {
@@ -132,7 +134,10 @@ func (f *fakeUploads) upload(ctx context.Context, _ *Api, item UploadWorkItem, _
 		if err != nil {
 			return "", false, false, err
 		}
-		return "key-" + name, false, false, nil
+		f.mu.Lock()
+		existed := f.inLibrary[name]
+		f.mu.Unlock()
+		return "key-" + name, false, existed, nil
 	case <-ctx.Done():
 		return "", false, false, ctx.Err()
 	}
@@ -848,5 +853,28 @@ func TestQueueThreadChangesApplyToTheRunningQueue(t *testing.T) {
 		if got := rec.itemByName(name).State; got != QueueItemDone {
 			t.Errorf("%s state = %q, want done", name, got)
 		}
+	}
+}
+
+func TestQueueRedropAddsAlreadyUploadedFilesToTheAlbum(t *testing.T) {
+	// The first run uploaded the files but quit before the album step; the
+	// files are now in the library and the album exists empty.
+	m, rec, up, albums := newTestQueue(t)
+	up.inLibrary = map[string]bool{"a.jpg": true, "b.jpg": true}
+	albums.existing = []LibraryAlbum{{MediaKey: "AF1Qip-trip", Title: "Trip"}}
+	opts := testOpts(1)
+	opts.AlbumName = "Trip"
+	m.Upload(writeMedia(t, t.TempDir(), "a.jpg", "b.jpg"), opts)
+	for range 2 {
+		name := <-up.started
+		up.gate(name) <- nil
+	}
+	rec.waitStop(t)
+
+	if got := albums.added["AF1Qip-trip"]; len(got) != 2 {
+		t.Fatalf("album got %v, want both already-uploaded files", got)
+	}
+	if got := rec.itemByName("a.jpg").State; got != QueueItemSkipped {
+		t.Fatalf("a.jpg state = %q, want skipped as already in the library", got)
 	}
 }

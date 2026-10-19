@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"app/core"
 	"app/internal/cli"
@@ -43,6 +44,8 @@ func runGUI() {
 	configManager := &core.ConfigManager{}
 	// Set once the app exists; thumbnails are only served for queued files.
 	var uploadManager *core.UploadManager
+	// confirmQuit is set once the window exists; see below.
+	var confirmQuit func() bool
 	thumbnails := thumbnail.NewServer(func(path string) bool {
 		return uploadManager != nil && uploadManager.HasItemPath(path)
 	})
@@ -67,6 +70,9 @@ func runGUI() {
 		Mac: application.MacOptions{
 			ApplicationShouldTerminateAfterLastWindowClosed: true,
 		},
+		ShouldQuit: func() bool {
+			return confirmQuit == nil || confirmQuit()
+		},
 	})
 
 	window := wailsApp.Window.NewWithOptions(application.WebviewWindowOptions{
@@ -87,6 +93,45 @@ func runGUI() {
 	})
 
 	uploadManager = core.NewUploadManager(gui.NewWailsReporter(wailsApp), wailsApp.Logger)
+
+	// Ask before quitting while files are queued, uploading, paused or still
+	// being added to albums: quitting then leaves them unfinished. The check
+	// returns at once and shows the question on its own; "Quit anyway" quits
+	// again with the question switched off.
+	var quitConfirmed, asking atomic.Bool
+	confirmQuit = func() bool {
+		if quitConfirmed.Load() || !uploadManager.IsRunning() {
+			return true
+		}
+		if asking.CompareAndSwap(false, true) {
+			go func() {
+				defer asking.Store(false)
+				dialog := wailsApp.Dialog.Question().
+					SetTitle("Uploads are not finished").
+					SetMessage("Some files have not finished uploading or have not been added to their albums yet. " +
+						"If you quit now, they are left as they are.\n\n" +
+						"To finish later, drop the same files into the same album again: files already uploaded " +
+						"are skipped and still added to the album.").
+					AttachToWindow(window)
+				quit := dialog.AddButton("Quit anyway")
+				keep := dialog.AddButton("Keep running")
+				dialog.SetDefaultButton(keep)
+				dialog.SetCancelButton(keep)
+				quit.OnClick(func() {
+					quitConfirmed.Store(true)
+					wailsApp.Quit()
+				})
+				dialog.Show()
+			}()
+		}
+		return false
+	}
+	// Closing the window quits the app too, so it asks the same question.
+	window.RegisterHook(events.Common.WindowClosing, func(event *application.WindowEvent) {
+		if !confirmQuit() {
+			event.Cancel()
+		}
+	})
 
 	// Queue controls from the frontend
 	wailsApp.Event.On("uploadCancel", func(e *application.CustomEvent) {

@@ -1051,7 +1051,7 @@ func (m *UploadManager) finishItem(workerID int, entry *queueEntry, ctx context.
 		code, reason := "remote-duplicate", "Already in your Google Photos library"
 		switch {
 		case entry.item.IsLivePhoto && mediaKey != "":
-			code, reason = "remote-live-photo-exists", "Already a Live Photo in your library"
+			code, reason = "remote-live-photo-exists", "Already in your Google Photos library"
 		case entry.item.IsLivePhoto:
 			code, reason = "remote-live-photo-component-exists", "Skipped because a Live Photo component already exists remotely"
 		}

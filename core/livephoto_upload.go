@@ -118,7 +118,8 @@ func uploadLivePhotoWithCallback(
 			FileName: displayName,
 			Message:  "Skipped: a Live Photo component already exists remotely",
 		})
-		return "", true, nil
+		// The still's key lets a re-drop into an album still add it there.
+		return photoRemoteKey, true, nil
 	}
 	// The VideoOriginal direction has not been recovered. A standalone remote MOV
 	// must not be combined with a newly uploaded still using the Phodeo request.

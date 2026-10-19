@@ -149,6 +149,14 @@ func TestUpdateExistingPhotoToLiveSkipsWhenMotionAttached(t *testing.T) {
 		}
 	})
 
+	t.Run("still exists, no update", func(t *testing.T) {
+		api := &fakeLivePhotoAPI{remote: map[string]string{string(photoHash): "photo"}}
+		key, skipped, err := uploadLivePhotoWithCallback(context.Background(), api, pair, LivePhotoUploadOptions{}, 0, NopReporter{})
+		if err != nil || !skipped || key != "photo" {
+			t.Fatalf("key=%q skipped=%v err=%v; want the existing still's key so albums still get it", key, skipped, err)
+		}
+	})
+
 	t.Run("still only", func(t *testing.T) {
 		api := &fakeLivePhotoAPI{remote: map[string]string{string(photoHash): "photo"}}
 		_, _, _ = uploadLivePhotoWithCallback(context.Background(), api, pair, opts, 0, NopReporter{})
