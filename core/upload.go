@@ -331,7 +331,7 @@ func uploadSingleFile(ctx context.Context, api *Api, filePath string, opts Uploa
 			Message:  "Checking if file exists in library...",
 		})
 
-		mediakey, err = api.FindRemoteMediaByHash(sha1_hash_bytes)
+		mediakey, err = findRemoteMedia(ctx, api, sha1_hash_bytes)
 		if err != nil {
 			// Never upload without knowing: Google stores an identical file as
 			// a second item. A rate limit or lost connection puts the file back

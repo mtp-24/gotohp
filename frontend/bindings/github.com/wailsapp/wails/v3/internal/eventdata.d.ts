@@ -22,6 +22,8 @@ declare module "@wailsio/runtime" {
             "queueItems": core$0.QueueItem[];
             "queueItemsUpdated": core$0.QueueItem[];
             "queueStatus": core$0.QueueStatus;
+            "restoreSession": void;
+            "sessionRestored": core$0.SessionSummary;
             "startUpload": core$0.StartUploadEvent;
             "uploadCancel": void;
             "uploadCancelItem": number;

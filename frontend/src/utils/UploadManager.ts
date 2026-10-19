@@ -87,6 +87,18 @@ export interface QueueStatus {
   RateLimitedUntil: number;
   // Dropped files still being scanned; Phase is "" when none are.
   Scan: { Phase: string; Found: number; Checked: number; Total: number };
+  // The library listing files are checked against before asking Google
+  // about each: Phase is "listing", "ready", "failed" or "" without one.
+  Library: { Phase: string; Items: number; Requests: number; Matched: number; Lookups: number };
+}
+
+// What a restored session brought back after the app restarted.
+export interface SessionSummary {
+  Restored: boolean;
+  Finished: number;
+  Remaining: number;
+  Failed: number;
+  AlbumFiles: number;
 }
 
 const idleQueueStatus = (): QueueStatus => ({
@@ -95,6 +107,7 @@ const idleQueueStatus = (): QueueStatus => ({
   StoppedReason: "",
   RateLimitedUntil: 0,
   Scan: { Phase: "", Found: 0, Checked: 0, Total: 0 },
+  Library: { Phase: "", Items: 0, Requests: 0, Matched: 0, Lookups: 0 },
 });
 
 // One album this run adds to, and how far it got.
@@ -129,6 +142,8 @@ export interface UploadState {
   itemCount: number;
   // The latest drop's summary, set when its scan finishes.
   lastDrop: DropSummary | null;
+  // Set when the queue saved before the app last quit was restored.
+  restored: SessionSummary | null;
   runId: number;
   queueStatus: QueueStatus;
   totalFiles: number;
@@ -160,6 +175,7 @@ class UploadManager {
     listVersion: 0,
     itemCount: 0,
     lastDrop: null,
+    restored: null,
     runId: 0,
     queueStatus: idleQueueStatus(),
     totalFiles: 0,
@@ -398,6 +414,13 @@ class UploadManager {
       // Emit a custom event that App.vue can listen to for showing toast
       window.dispatchEvent(new CustomEvent('albumError', { detail: event.data }));
     });
+
+    Events.On("sessionRestored", (event: { data: SessionSummary }) => {
+      this.state.restored = event.data;
+    });
+    // Asked for once the listeners above are in place, so the restored
+    // queue's events are not missed.
+    Events.Emit("restoreSession");
   }
 
   private updateBytesAndSpeed() {

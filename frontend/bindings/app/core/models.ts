@@ -221,6 +221,58 @@ export class FilesDroppedEvent {
 }
 
 /**
+ * LibraryCheck describes a library listing and how many files it settled.
+ */
+export class LibraryCheck {
+    /**
+     * Phase is "listing", "ready", "failed", or "" when no listing was made.
+     */
+    "Phase": string;
+
+    /**
+     * Items is the number of library items listed, in Requests requests.
+     */
+    "Items": number;
+    "Requests": number;
+
+    /**
+     * Matched counts files found in the listing; Lookups counts files the
+     * listing did not have, which were looked up one by one.
+     */
+    "Matched": number;
+    "Lookups": number;
+
+    /** Creates a new LibraryCheck instance. */
+    constructor($$source: Partial<LibraryCheck> = {}) {
+        if (!("Phase" in $$source)) {
+            this["Phase"] = "";
+        }
+        if (!("Items" in $$source)) {
+            this["Items"] = 0;
+        }
+        if (!("Requests" in $$source)) {
+            this["Requests"] = 0;
+        }
+        if (!("Matched" in $$source)) {
+            this["Matched"] = 0;
+        }
+        if (!("Lookups" in $$source)) {
+            this["Lookups"] = 0;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new LibraryCheck instance from a string or object.
+     */
+    static createFrom($$source: any = {}): LibraryCheck {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new LibraryCheck($$parsedSource as Partial<LibraryCheck>);
+    }
+}
+
+/**
  * Preferences are GUI settings. The CLI never reads them; every CLI run is
  * configured by flags alone.
  */
@@ -456,6 +508,11 @@ export class QueueStatus {
      */
     "Scan": ScanProgress;
 
+    /**
+     * Library describes the latest library listing files are checked against.
+     */
+    "Library": LibraryCheck;
+
     /** Creates a new QueueStatus instance. */
     constructor($$source: Partial<QueueStatus> = {}) {
         if (!("Paused" in $$source)) {
@@ -473,6 +530,9 @@ export class QueueStatus {
         if (!("Scan" in $$source)) {
             this["Scan"] = (new ScanProgress());
         }
+        if (!("Library" in $$source)) {
+            this["Library"] = (new LibraryCheck());
+        }
 
         Object.assign(this, $$source);
     }
@@ -482,9 +542,13 @@ export class QueueStatus {
      */
     static createFrom($$source: any = {}): QueueStatus {
         const $$createField4_0 = $$createType3;
+        const $$createField5_0 = $$createType4;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("Scan" in $$parsedSource) {
             $$parsedSource["Scan"] = $$createField4_0($$parsedSource["Scan"]);
+        }
+        if ("Library" in $$parsedSource) {
+            $$parsedSource["Library"] = $$createField5_0($$parsedSource["Library"]);
         }
         return new QueueStatus($$parsedSource as Partial<QueueStatus>);
     }
@@ -535,6 +599,55 @@ export class ScanProgress {
     static createFrom($$source: any = {}): ScanProgress {
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         return new ScanProgress($$parsedSource as Partial<ScanProgress>);
+    }
+}
+
+/**
+ * SessionSummary describes a restored session.
+ */
+export class SessionSummary {
+    "Restored": boolean;
+
+    /**
+     * Finished counts items that uploaded, were already in the library, or
+     * were skipped; Remaining counts items still to upload.
+     */
+    "Finished": number;
+    "Remaining": number;
+    "Failed": number;
+
+    /**
+     * AlbumFiles counts uploaded files still to be added to their album.
+     */
+    "AlbumFiles": number;
+
+    /** Creates a new SessionSummary instance. */
+    constructor($$source: Partial<SessionSummary> = {}) {
+        if (!("Restored" in $$source)) {
+            this["Restored"] = false;
+        }
+        if (!("Finished" in $$source)) {
+            this["Finished"] = 0;
+        }
+        if (!("Remaining" in $$source)) {
+            this["Remaining"] = 0;
+        }
+        if (!("Failed" in $$source)) {
+            this["Failed"] = 0;
+        }
+        if (!("AlbumFiles" in $$source)) {
+            this["AlbumFiles"] = 0;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new SessionSummary instance from a string or object.
+     */
+    static createFrom($$source: any = {}): SessionSummary {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new SessionSummary($$parsedSource as Partial<SessionSummary>);
     }
 }
 
@@ -662,3 +775,4 @@ const $$createType0 = AccountSummary.createFrom;
 const $$createType1 = $Create.Array($$createType0);
 const $$createType2 = $Create.Array($Create.Any);
 const $$createType3 = ScanProgress.createFrom;
+const $$createType4 = LibraryCheck.createFrom;

@@ -195,7 +195,9 @@ func newTestQueue(t *testing.T) (*UploadManager, *queueRecorder, *fakeUploads, *
 	m.newApi = func(ApiOptions) (*Api, error) { return &Api{}, nil }
 	m.uploadItem = uploads.upload
 	m.newAlbumAPI = func(ApiOptions) (albumAPI, error) { return albums, nil }
-	m.listAlbums = func(context.Context, ApiOptions) ([]LibraryAlbum, error) { return albums.existing, nil }
+	m.listLibrary = func(context.Context, ApiOptions) ([]LibraryItem, []LibraryAlbum, int, error) {
+		return nil, albums.existing, 1, nil
+	}
 	m.probe = func(context.Context, string) error { return nil }
 	m.probeInterval = 10 * time.Millisecond
 	return m, recorder, uploads, albums
@@ -807,7 +809,9 @@ func TestQueueAutoAlbumReusesExistingFolderAlbum(t *testing.T) {
 
 func TestQueueCreatesAlbumWhenListingFails(t *testing.T) {
 	m, rec, up, albums := newTestQueue(t)
-	m.listAlbums = func(context.Context, ApiOptions) ([]LibraryAlbum, error) { return nil, errors.New("offline") }
+	m.listLibrary = func(context.Context, ApiOptions) ([]LibraryItem, []LibraryAlbum, int, error) {
+		return nil, nil, 0, errors.New("offline")
+	}
 	opts := testOpts(1)
 	opts.AlbumName = "Trip"
 	m.Upload(writeMedia(t, t.TempDir(), "a.jpg"), opts)

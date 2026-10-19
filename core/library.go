@@ -65,6 +65,14 @@ func (a *Api) ListAlbums(ctx context.Context) ([]LibraryAlbum, error) {
 	return albums, err
 }
 
+// ListLibrary lists the account's items and albums in one pass, and the
+// number of requests it took.
+func (a *Api) ListLibrary(ctx context.Context) ([]LibraryItem, []LibraryAlbum, int, error) {
+	pages := 0
+	items, albums, err := a.syncLibrary(ctx, func(int) { pages++ })
+	return items, albums, pages, err
+}
+
 func (a *Api) syncLibrary(ctx context.Context, onPage func(items int)) ([]LibraryItem, []LibraryAlbum, error) {
 	page, err := a.libraryRequest(ctx, libraryStateRequest(""))
 	if err != nil {

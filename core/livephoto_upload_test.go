@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"os"
@@ -91,9 +92,11 @@ type fakeLivePhotoAPI struct {
 	motion     map[string]string
 	uploads    int
 	reconciled int
+	lookups    int
 }
 
 func (f *fakeLivePhotoAPI) FindRemoteMediaByHash(hash []byte) (string, error) {
+	f.lookups++
 	return f.remote[string(hash)], nil
 }
 
@@ -154,6 +157,17 @@ func TestUpdateExistingPhotoToLiveSkipsWhenMotionAttached(t *testing.T) {
 		key, skipped, err := uploadLivePhotoWithCallback(context.Background(), api, pair, LivePhotoUploadOptions{}, 0, NopReporter{})
 		if err != nil || !skipped || key != "photo" {
 			t.Fatalf("key=%q skipped=%v err=%v; want the existing still's key so albums still get it", key, skipped, err)
+		}
+	})
+
+	t.Run("still in the library listing", func(t *testing.T) {
+		listing := newLibraryListing()
+		listing.finish([]LibraryItem{{MediaKey: "photo", DedupKey: base64.RawURLEncoding.EncodeToString(photoHash)}}, nil, 1, nil)
+		ctx := withLibraryListing(context.Background(), listing)
+		api := &fakeLivePhotoAPI{}
+		key, skipped, err := uploadLivePhotoWithCallback(ctx, api, pair, LivePhotoUploadOptions{}, 0, NopReporter{})
+		if err != nil || !skipped || key != "photo" || api.lookups != 0 {
+			t.Fatalf("key=%q skipped=%v err=%v lookups=%d; want the listing's key and no lookups", key, skipped, err, api.lookups)
 		}
 	})
 

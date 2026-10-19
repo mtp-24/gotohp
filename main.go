@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"app/core"
@@ -73,6 +74,14 @@ func runGUI() {
 		ShouldQuit: func() bool {
 			return confirmQuit == nil || confirmQuit()
 		},
+		OnShutdown: func() {
+			// The latest queue state, so the next launch restores it.
+			if uploadManager != nil {
+				if err := uploadManager.SaveSession(); err != nil {
+					log.Printf("save queue session: %v", err)
+				}
+			}
+		},
 	})
 
 	window := wailsApp.Window.NewWithOptions(application.WebviewWindowOptions{
@@ -93,11 +102,13 @@ func runGUI() {
 	})
 
 	uploadManager = core.NewUploadManager(gui.NewWailsReporter(wailsApp), wailsApp.Logger)
+	uploadManager.EnableSession(core.SessionPath())
 
 	// Ask before quitting while files are queued, uploading, paused or still
-	// being added to albums: quitting then leaves them unfinished. The check
-	// returns at once and shows the question on its own; "Quit anyway" quits
-	// again with the question switched off.
+	// being added to albums. The queue is saved and restored on the next
+	// launch, but uploads stop meanwhile. The check returns at once and shows
+	// the question on its own; "Quit" quits again with the question switched
+	// off.
 	var quitConfirmed, asking atomic.Bool
 	confirmQuit = func() bool {
 		if quitConfirmed.Load() || !uploadManager.IsRunning() {
@@ -108,12 +119,12 @@ func runGUI() {
 				defer asking.Store(false)
 				dialog := wailsApp.Dialog.Question().
 					SetTitle("Uploads are not finished").
-					SetMessage("Some files have not finished uploading or have not been added to their albums yet. " +
-						"If you quit now, they are left as they are.\n\n" +
-						"To finish later, drop the same files into the same album again: files already uploaded " +
-						"are skipped and still added to the album.").
+					SetMessage("Some files have not finished uploading or have not been added to their albums yet.\n\n" +
+						"The queue is saved: when you open gotohp again, it comes back paused, and Resume carries on " +
+						"where it stopped. Files already uploaded are not checked again. Folders still being " +
+						"scanned are not saved; drop them again after reopening.").
 					AttachToWindow(window)
-				quit := dialog.AddButton("Quit anyway")
+				quit := dialog.AddButton("Quit")
 				keep := dialog.AddButton("Keep running")
 				dialog.SetDefaultButton(keep)
 				dialog.SetCancelButton(keep)
@@ -165,6 +176,20 @@ func runGUI() {
 	})
 	wailsApp.Event.On("uploadClearFinished", func(e *application.CustomEvent) {
 		uploadManager.ClearFinished()
+	})
+	// The page asks once it listens for queue events, so none are missed.
+	var restoreOnce sync.Once
+	wailsApp.Event.On("restoreSession", func(e *application.CustomEvent) {
+		restoreOnce.Do(func() {
+			summary, err := uploadManager.RestoreSession()
+			if err != nil {
+				wailsApp.Logger.Error("Could not restore the saved queue", "error", err)
+				return
+			}
+			if summary.Restored {
+				wailsApp.Event.Emit("sessionRestored", summary)
+			}
+		})
 	})
 
 	// On macOS a native view receives file drags, so the page gets no reliable

@@ -32,4 +32,6 @@ func init() {
 	application.RegisterEvent[application.Void]("uploadRetryFailed")
 	application.RegisterEvent[application.Void]("uploadSkipped")
 	application.RegisterEvent[application.Void]("uploadClearFinished")
+	application.RegisterEvent[application.Void]("restoreSession")
+	application.RegisterEvent[core.SessionSummary]("sessionRestored")
 }

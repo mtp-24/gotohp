@@ -66,13 +66,9 @@ func uploadLivePhotoWithCallback(
 		FileName: displayName,
 		Message:  "Checking both Live Photo components...",
 	})
-	photoRemoteKey, photoCheckErr := api.FindRemoteMediaByHash(photoSHA1)
-	videoRemoteKey, videoCheckErr := api.FindRemoteMediaByHash(videoSHA1)
-	if photoCheckErr != nil {
-		return "", false, fmt.Errorf("check Live Photo still deduplication: %w", photoCheckErr)
-	}
-	if videoCheckErr != nil {
-		return "", false, fmt.Errorf("check Live Photo video deduplication: %w", videoCheckErr)
+	photoRemoteKey, err := findRemoteMedia(ctx, api, photoSHA1)
+	if err != nil {
+		return "", false, fmt.Errorf("check Live Photo still deduplication: %w", err)
 	}
 	if photoRemoteKey != "" {
 		if options.UpdateExistingPhotosToLive {
@@ -120,6 +116,11 @@ func uploadLivePhotoWithCallback(
 		})
 		// The still's key lets a re-drop into an album still add it there.
 		return photoRemoteKey, true, nil
+	}
+	// The video only matters when the still is not in the library yet.
+	videoRemoteKey, err := findRemoteMedia(ctx, api, videoSHA1)
+	if err != nil {
+		return "", false, fmt.Errorf("check Live Photo video deduplication: %w", err)
 	}
 	// The VideoOriginal direction has not been recovered. A standalone remote MOV
 	// must not be combined with a newly uploaded still using the Phodeo request.

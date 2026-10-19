@@ -21,9 +21,10 @@ function configure() {
         "queueItems": $$createType6,
         "queueItemsUpdated": $$createType6,
         "queueStatus": $$createType7,
-        "startUpload": $$createType8,
-        "uploadStart": $$createType9,
-        "uploadWarning": $$createType10,
+        "sessionRestored": $$createType8,
+        "startUpload": $$createType9,
+        "uploadStart": $$createType10,
+        "uploadWarning": $$createType11,
     }));
 }
 
@@ -36,8 +37,9 @@ const $$createType4 = core$0.FilesDroppedEvent.createFrom;
 const $$createType5 = core$0.QueueItem.createFrom;
 const $$createType6 = $Create.Array($$createType5);
 const $$createType7 = core$0.QueueStatus.createFrom;
-const $$createType8 = core$0.StartUploadEvent.createFrom;
-const $$createType9 = core$0.UploadBatchStart.createFrom;
-const $$createType10 = core$0.PreflightWarning.createFrom;
+const $$createType8 = core$0.SessionSummary.createFrom;
+const $$createType9 = core$0.StartUploadEvent.createFrom;
+const $$createType10 = core$0.UploadBatchStart.createFrom;
+const $$createType11 = core$0.PreflightWarning.createFrom;
 
 configure();

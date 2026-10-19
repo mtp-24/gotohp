@@ -331,6 +331,31 @@ watch(() => state.lastDrop, (drop) => {
   }
 })
 
+// The queue saved before the app last quit comes back paused; say so.
+watch(() => state.restored, (restored) => {
+  if (!restored) return
+  const parts = [`${restored.Finished.toLocaleString()} finished`]
+  if (restored.Remaining) parts.push(`${restored.Remaining.toLocaleString()} to upload`)
+  if (restored.Failed) parts.push(`${restored.Failed.toLocaleString()} failed`)
+  if (restored.AlbumFiles) parts.push(`${restored.AlbumFiles.toLocaleString()} to add to albums`)
+  toast.success('Restored your queue from last time', {
+    description: parts.join(' · ') + (restored.Remaining ? '. Press Resume to carry on.' : ''),
+    duration: 10000,
+  })
+  // Once only, even if this screen is shown again later.
+  state.restored = null
+}, { immediate: true })
+
+// The library listing large drops are checked against, and what it saved.
+const libraryLabel = computed(() => {
+  const library = state.queueStatus.Library
+  if (!state.isUploading || !library?.Phase) return ''
+  if (library.Phase === 'listing') return 'Reading your Google Photos library to check files against it…'
+  if (library.Phase === 'failed') return 'Could not read your library; checking each file with Google instead'
+  return `Library read: ${library.Items.toLocaleString()} items in ${library.Requests.toLocaleString()} requests · ` +
+    `${library.Matched.toLocaleString()} files found in it · ${library.Lookups.toLocaleString()} checked with Google`
+})
+
 // One row per kind of warning, with its files, instead of one row each.
 const warningGroups = computed(() => {
   const groups = new Map<string, { message: string; paths: string[] }>()
@@ -431,6 +456,14 @@ async function copyResults() {
         class="h-1 mt-1"
       />
     </div>
+
+    <p
+      v-if="libraryLabel"
+      class="rounded-md border bg-muted/30 px-2.5 py-1.5 text-[11px] leading-snug text-muted-foreground tabular-nums"
+      title="Files found in the listing are not looked up one by one. Files it does not have are still checked with Google before any upload."
+    >
+      {{ libraryLabel }}
+    </p>
 
     <div class="flex gap-3 justify-center text-xs text-muted-foreground">
       <div class="flex items-center gap-1.5">

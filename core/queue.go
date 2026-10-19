@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -59,6 +61,21 @@ type QueueStatus struct {
 	RateLimitedUntil int64 `json:"RateLimitedUntil"`
 	// Scan describes dropped files still being scanned.
 	Scan ScanProgress `json:"Scan"`
+	// Library describes the latest library listing files are checked against.
+	Library LibraryCheck `json:"Library"`
+}
+
+// LibraryCheck describes a library listing and how many files it settled.
+type LibraryCheck struct {
+	// Phase is "listing", "ready", "failed", or "" when no listing was made.
+	Phase string `json:"Phase"`
+	// Items is the number of library items listed, in Requests requests.
+	Items    int `json:"Items"`
+	Requests int `json:"Requests"`
+	// Matched counts files found in the listing; Lookups counts files the
+	// listing did not have, which were looked up one by one.
+	Matched int64 `json:"Matched"`
+	Lookups int64 `json:"Lookups"`
 }
 
 // ScanProgress sums the drops still being scanned before their files queue.
@@ -122,6 +139,12 @@ type uploadBatch struct {
 	remaining int
 	// uploads holds items that ended with a media key since the last album pass.
 	uploads []albumUpload
+	// albumInFlight holds the uploads of album passes still running, by pass,
+	// so a saved session keeps them until they are in their album.
+	albumInFlight map[int64][]albumUpload
+	// library, when set, is the listing this batch's files are checked
+	// against before asking Google about each one.
+	library *libraryListing
 }
 
 type albumUpload struct {
@@ -171,15 +194,29 @@ type UploadManager struct {
 	hashes     *hashMemo
 	scans      map[*uploadBatch]struct{}
 	lastScanAt time.Time
+	// lastLibraryAt throttles status reports of library check counts.
+	lastLibraryAt time.Time
 
-	albumMu   sync.Mutex
-	albumKeys map[string]string
-	// albumLists holds the account's existing albums, listed once per
-	// account in the background, so drops into an album that already exists
-	// add to it instead of creating a duplicate. Guarded by albumListMu, not
-	// albumMu, which album passes hold for as long as they run.
-	albumListMu sync.Mutex
-	albumLists  map[string]*albumList
+	albumMu sync.Mutex
+	// albumKeys caches the albums used this session by target; guarded by
+	// albumKeysMu, so saving the session does not wait for album passes.
+	albumKeysMu   sync.Mutex
+	albumKeys     map[string]string
+	nextAlbumPass int64
+
+	// sessionPath, when set, is where the queue is saved as it changes.
+	sessionPath   string
+	sessionDirty  atomic.Bool
+	sessionSaveMu sync.Mutex
+	// libraries holds each account's latest library listing, made in the
+	// background: drops into an album that already exists add to it instead
+	// of creating a duplicate, and large drops check files against it.
+	// Guarded by libraryMu, not albumMu, which album passes hold for as long
+	// as they run.
+	libraryMu sync.Mutex
+	libraries map[string]*libraryListing
+	// library is the listing shown in the queue status.
+	library *libraryListing
 
 	// Network, upload and album hooks, replaced in tests.
 	probe         func(ctx context.Context, proxy string) error
@@ -187,14 +224,7 @@ type UploadManager struct {
 	newApi        func(ApiOptions) (*Api, error)
 	uploadItem    func(ctx context.Context, api *Api, item UploadWorkItem, opts UploadOptions, workerID int, reporter UploadReporter) (mediaKey string, skipped, existed bool, err error)
 	newAlbumAPI   func(ApiOptions) (albumAPI, error)
-	listAlbums    func(context.Context, ApiOptions) ([]LibraryAlbum, error)
-}
-
-// albumList is one account's existing albums by title, once listed.
-type albumList struct {
-	done    chan struct{}
-	byTitle map[string][]LibraryAlbum
-	err     error
+	listLibrary   func(context.Context, ApiOptions) ([]LibraryItem, []LibraryAlbum, int, error)
 }
 
 // NewUploadManager creates a manager that reports progress to reporter. A nil
@@ -218,7 +248,7 @@ func NewUploadManager(reporter UploadReporter, logger *slog.Logger) *UploadManag
 		hashes:        newHashMemo(),
 		scans:         make(map[*uploadBatch]struct{}),
 		albumKeys:     make(map[string]string),
-		albumLists:    make(map[string]*albumList),
+		libraries:     make(map[string]*libraryListing),
 		probe:         probeGooglePhotos,
 		probeInterval: defaultNetworkProbeInterval,
 		newApi:        NewApi,
@@ -230,12 +260,12 @@ func NewUploadManager(reporter UploadReporter, logger *slog.Logger) *UploadManag
 			}
 			return api, nil
 		},
-		listAlbums: func(ctx context.Context, opts ApiOptions) ([]LibraryAlbum, error) {
+		listLibrary: func(ctx context.Context, opts ApiOptions) ([]LibraryItem, []LibraryAlbum, int, error) {
 			api, err := NewApi(opts)
 			if err != nil {
-				return nil, err
+				return nil, nil, 0, err
 			}
-			return api.ListAlbums(ctx)
+			return api.ListLibrary(ctx)
 		},
 	}
 	m.cond = sync.NewCond(&m.mu)
@@ -268,45 +298,62 @@ func (m *UploadManager) Upload(paths []string, opts UploadOptions) {
 	m.tasks++
 	m.mu.Unlock()
 
-	if opts.AlbumAutoMode || (opts.AlbumName != "" && !IsAlbumKey(opts.AlbumName)) {
-		m.startAlbumListing(opts.Api)
+	if opts.needsAlbumList() {
+		// Listed now, while the files are scanned: the album pass needs it,
+		// and the batch's files are checked against it for free.
+		m.setBatchLibrary(batch, m.libraryListing(opts.Api))
 	}
 	go m.preflight(batch, paths)
 }
 
-// startAlbumListing lists the account's albums in the background, once per
-// account, ready for the album pass at the end of the batch. Listing reads
-// the whole library sync, which can take a minute on a large library; the
-// uploads usually take longer.
-func (m *UploadManager) startAlbumListing(opts ApiOptions) {
-	m.albumListMu.Lock()
-	defer m.albumListMu.Unlock()
-	if _, ok := m.albumLists[opts.Account]; ok {
-		return
-	}
-	list := &albumList{done: make(chan struct{})}
-	m.albumLists[opts.Account] = list
-	go func() {
-		defer close(list.done)
-		albums, err := m.listAlbums(context.Background(), opts)
-		if err != nil {
-			list.err = err
-			return
-		}
-		list.byTitle = make(map[string][]LibraryAlbum)
-		for _, album := range albums {
-			list.byTitle[album.Title] = append(list.byTitle[album.Title], album)
-		}
-	}()
+// needsAlbumList reports whether uploads go to albums named by title, which
+// are reused when they already exist.
+func (o UploadOptions) needsAlbumList() bool {
+	return o.AlbumAutoMode || (o.AlbumName != "" && !IsAlbumKey(o.AlbumName))
 }
 
-// existingAlbums waits for the account's album list. It returns nil, after
-// warning, when the albums could not be listed: new albums are then created
-// as before.
-func (m *UploadManager) existingAlbums(ctx context.Context, opts ApiOptions) *albumList {
-	m.albumListMu.Lock()
-	list := m.albumLists[opts.Account]
-	m.albumListMu.Unlock()
+func (m *UploadManager) setBatchLibrary(batch *uploadBatch, listing *libraryListing) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	batch.library = listing
+	m.library = listing
+	m.reportStatusLocked()
+}
+
+// libraryListing returns the account's library listing, starting one in the
+// background unless one is running or finished recently. Listing reads the
+// whole library sync, which can take a minute on a large library; uploads
+// usually take longer.
+func (m *UploadManager) libraryListing(opts ApiOptions) *libraryListing {
+	m.libraryMu.Lock()
+	defer m.libraryMu.Unlock()
+	if listing := m.libraries[opts.Account]; listing != nil && listing.fresh() {
+		return listing
+	}
+	listing := newLibraryListing()
+	m.libraries[opts.Account] = listing
+	go func() {
+		items, albums, pages, err := m.listLibrary(context.Background(), opts)
+		listing.finish(items, albums, pages, err)
+		if err != nil {
+			m.logger.Error("library listing failed", "error", err)
+		} else {
+			m.logger.Info("library listed", "items", len(items), "albums", len(albums), "requests", pages)
+		}
+		m.mu.Lock()
+		m.reportStatusLocked()
+		m.mu.Unlock()
+	}()
+	return listing
+}
+
+// existingAlbums waits for the account's library listing, for its albums.
+// It returns nil, after warning, when the library could not be listed: new
+// albums are then created as before.
+func (m *UploadManager) existingAlbums(ctx context.Context, opts ApiOptions) *libraryListing {
+	m.libraryMu.Lock()
+	list := m.libraries[opts.Account]
+	m.libraryMu.Unlock()
 	if list == nil {
 		return nil
 	}
@@ -320,12 +367,6 @@ func (m *UploadManager) existingAlbums(ctx context.Context, opts ApiOptions) *al
 			Code:    "album-lookup-failed",
 			Message: fmt.Sprintf("Could not check for existing albums, so new albums may duplicate existing ones: %v", list.err),
 		})
-		// Try again on the next album pass.
-		m.albumListMu.Lock()
-		if m.albumLists[opts.Account] == list {
-			delete(m.albumLists, opts.Account)
-		}
-		m.albumListMu.Unlock()
 		return nil
 	}
 	return list
@@ -527,6 +568,7 @@ func (m *UploadManager) retry(match func(*queueEntry) bool) {
 
 // ClearFinished forgets finished items so they can no longer be retried.
 func (m *UploadManager) ClearFinished() {
+	defer m.markChanged()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for id, entry := range m.items {
@@ -572,6 +614,9 @@ func (m *UploadManager) statusLocked() QueueStatus {
 	status := QueueStatus{Paused: m.paused, WaitingForNetwork: m.waitingForNetwork, StoppedReason: m.stoppedReason}
 	if !m.rateLimitedUntil.IsZero() {
 		status.RateLimitedUntil = m.rateLimitedUntil.UnixMilli()
+	}
+	if listing := m.library; listing != nil {
+		status.Library = listing.check()
 	}
 	for batch := range m.scans {
 		status.Scan.Found += batch.scan.Found
@@ -619,6 +664,14 @@ func (m *UploadManager) preflight(batch *uploadBatch, paths []string) {
 	var apiErr error
 	if len(workItems) > 0 {
 		_, apiErr = m.newApi(opts.Api)
+	}
+	if apiErr == nil && !opts.ForceUpload && len(workItems) >= libraryIndexMinItems {
+		m.mu.Lock()
+		listed := batch.library != nil
+		m.mu.Unlock()
+		if !listed {
+			m.setBatchLibrary(batch, m.libraryListing(opts.Api))
+		}
 	}
 	m.addBatchItems(batch, workItems, append(scanWarnings, classifyWarnings...), apiErr)
 	m.scanFinished(batch)
@@ -701,6 +754,7 @@ func (m *UploadManager) addBatchItems(batch *uploadBatch, workItems []UploadWork
 	m.mu.Unlock()
 
 	m.reporter.UploadStart(UploadBatchStart{Total: total})
+	m.markChanged()
 	if m.queue != nil && len(added) > 0 {
 		m.queue.QueueItems(added)
 	}
@@ -782,6 +836,7 @@ func (m *UploadManager) addScanFailure(batch *uploadBatch, paths []string, err e
 	item := entry.item
 	m.mu.Unlock()
 	m.reporter.UploadStart(UploadBatchStart{Total: total})
+	m.markChanged()
 	if m.queue != nil {
 		m.queue.QueueItems([]QueueItem{item})
 	}
@@ -920,7 +975,7 @@ func (m *UploadManager) nextItem(workerID int) (*queueEntry, context.Context, Qu
 			m.pending = m.pending[1:]
 			entry.item.State = QueueItemActive
 			entry.item.Message = ""
-			ctx, cancel := context.WithCancel(withHashMemo(entry.batch.ctx, m.hashes))
+			ctx, cancel := context.WithCancel(withLibraryListing(withHashMemo(entry.batch.ctx, m.hashes), entry.batch.library))
 			entry.cancel = cancel
 			return entry, ctx, entry.item
 		}
@@ -960,6 +1015,7 @@ func (m *UploadManager) runWorker(workerID int) {
 			}
 		}
 		if err == nil {
+			m.waitForLibrary(ctx, workerID, entry)
 			mediaKey, skipped, existed, err = m.uploadItem(ctx, api, entry.work, opts, workerID, m.reporter)
 		}
 		m.finishItem(workerID, entry, ctx, mediaKey, skipped, existed, err)
@@ -967,6 +1023,26 @@ func (m *UploadManager) runWorker(workerID int) {
 		m.reporter.ThreadStatus(ThreadStatus{WorkerID: workerID, Status: "idle", Message: "Waiting for next file..."})
 	}
 	m.reporter.ThreadStatus(ThreadStatus{WorkerID: workerID, Status: "idle", Message: "Finished"})
+}
+
+// waitForLibrary holds an item until the library listing its batch is checked
+// against is ready, so its files are not looked up one by one meanwhile.
+func (m *UploadManager) waitForLibrary(ctx context.Context, workerID int, entry *queueEntry) {
+	listing := libraryListingFrom(ctx)
+	if listing == nil || listing.ready() {
+		return
+	}
+	m.reporter.ThreadStatus(ThreadStatus{
+		WorkerID: workerID,
+		Status:   "checking",
+		FilePath: entry.item.Path,
+		FileName: entry.item.Name,
+		Message:  "Reading your Google Photos library...",
+	})
+	select {
+	case <-listing.done:
+	case <-ctx.Done():
+	}
 }
 
 func (m *UploadManager) finishItem(workerID int, entry *queueEntry, ctx context.Context, mediaKey string, skipped, existed bool, err error) {
@@ -1086,6 +1162,11 @@ func (m *UploadManager) finishItem(workerID int, entry *queueEntry, ctx context.
 		finalize = m.batchDoneLocked(entry.batch)
 	}
 	item := entry.item
+	if m.library != nil && time.Since(m.lastLibraryAt) >= time.Second {
+		// Keeps the counts of files found in the library listing current.
+		m.lastLibraryAt = time.Now()
+		m.reportStatusLocked()
+	}
 	m.cond.Broadcast()
 	m.mu.Unlock()
 
@@ -1149,11 +1230,23 @@ func (m *UploadManager) startAlbumPass(batch *uploadBatch) {
 		m.mu.Unlock()
 		return
 	}
+	m.nextAlbumPass++
+	pass := m.nextAlbumPass
+	if batch.albumInFlight == nil {
+		batch.albumInFlight = make(map[int64][]albumUpload)
+	}
+	batch.albumInFlight[pass] = uploads
 	m.tasks++
 	m.mu.Unlock()
 	go func() {
 		defer m.taskDone()
 		m.handleAlbumCreation(albumCtx, batch.opts, uploads)
+		// A pass cut short by quitting never gets here, so it stays in the
+		// saved session to run again.
+		m.mu.Lock()
+		delete(batch.albumInFlight, pass)
+		m.mu.Unlock()
+		m.markChanged()
 	}()
 }
 
@@ -1244,6 +1337,7 @@ func (m *UploadManager) reportStatusLocked() {
 }
 
 func (m *UploadManager) reportUpdates(items []QueueItem) {
+	m.markChanged()
 	if m.queue == nil {
 		return
 	}
@@ -1310,6 +1404,32 @@ func (m *UploadManager) handleAlbumCreation(ctx context.Context, opts UploadOpti
 	}
 }
 
+func (m *UploadManager) albumKey(cacheKey string) (string, bool) {
+	m.albumKeysMu.Lock()
+	defer m.albumKeysMu.Unlock()
+	key, ok := m.albumKeys[cacheKey]
+	return key, ok
+}
+
+func (m *UploadManager) setAlbumKey(cacheKey, albumKey string) {
+	m.albumKeysMu.Lock()
+	defer m.albumKeysMu.Unlock()
+	m.albumKeys[cacheKey] = albumKey
+}
+
+func (m *UploadManager) albumKeysSnapshot() map[string]string {
+	m.albumKeysMu.Lock()
+	defer m.albumKeysMu.Unlock()
+	return maps.Clone(m.albumKeys)
+}
+
+// setAlbumKeys restores albums used by a saved session.
+func (m *UploadManager) setAlbumKeys(keys map[string]string) {
+	m.albumKeysMu.Lock()
+	defer m.albumKeysMu.Unlock()
+	maps.Copy(m.albumKeys, keys)
+}
+
 // albumDisplayName is the name album events use for nameOrKey.
 func albumDisplayName(nameOrKey string) string {
 	if IsAlbumKey(nameOrKey) {
@@ -1323,10 +1443,10 @@ func albumDisplayName(nameOrKey string) string {
 // cacheKey), else an existing album with exactly that title, and creates one
 // only when neither exists. existing may be nil when albums could not be
 // listed.
-func (m *UploadManager) addToSessionAlbum(albumManager *AlbumManager, existing *albumList, cacheKey, nameOrKey string, mediaKeys []string) {
+func (m *UploadManager) addToSessionAlbum(albumManager *AlbumManager, existing *libraryListing, cacheKey, nameOrKey string, mediaKeys []string) {
 	var albumKeys []string
 	var err error
-	cached, isCached := m.albumKeys[cacheKey]
+	cached, isCached := m.albumKey(cacheKey)
 	match, matched := pickExistingAlbum(existing, nameOrKey, len(mediaKeys))
 	switch {
 	case IsAlbumKey(nameOrKey):
@@ -1342,12 +1462,12 @@ func (m *UploadManager) addToSessionAlbum(albumManager *AlbumManager, existing *
 		}
 		albumKeys, err = albumManager.addToExistingAlbum(mediaKeys, match.MediaKey, nameOrKey)
 		if err == nil {
-			m.albumKeys[cacheKey] = match.MediaKey
+			m.setAlbumKey(cacheKey, match.MediaKey)
 		}
 	default:
 		albumKeys, err = albumManager.AddToAlbum(mediaKeys, nameOrKey)
 		if err == nil && len(albumKeys) == 1 {
-			m.albumKeys[cacheKey] = albumKeys[0]
+			m.setAlbumKey(cacheKey, albumKeys[0])
 			if existing != nil {
 				// Later drops with this name, even from another folder, reuse it.
 				existing.byTitle[nameOrKey] = append(existing.byTitle[nameOrKey], LibraryAlbum{
@@ -1370,7 +1490,7 @@ func (m *UploadManager) addToSessionAlbum(albumManager *AlbumManager, existing *
 // pickExistingAlbum returns the existing album titled name to add count items
 // to: with several, the one with the most items, skipping any the items would
 // push past the album limit.
-func pickExistingAlbum(existing *albumList, name string, count int) (LibraryAlbum, bool) {
+func pickExistingAlbum(existing *libraryListing, name string, count int) (LibraryAlbum, bool) {
 	if existing == nil || IsAlbumKey(name) {
 		return LibraryAlbum{}, false
 	}
@@ -1388,7 +1508,7 @@ func pickExistingAlbum(existing *albumList, name string, count int) (LibraryAlbu
 }
 
 // albumAdded keeps the cached item count of a reused album current.
-func (m *UploadManager) albumAdded(existing *albumList, name string, albumKeys []string, count int) {
+func (m *UploadManager) albumAdded(existing *libraryListing, name string, albumKeys []string, count int) {
 	if existing == nil || len(albumKeys) != 1 {
 		return
 	}
