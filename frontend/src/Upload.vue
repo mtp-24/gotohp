@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { toast } from 'vue-sonner'
 import Button from "./components/ui/button/Button.vue"
 import { Progress } from "./components/ui/progress"
 import { ScrollArea } from "./components/ui/scroll-area"
@@ -39,6 +40,8 @@ onUnmounted(() => {
   if (elapsedInterval) {
     clearInterval(elapsedInterval)
   }
+  if (scanHideTimer) clearTimeout(scanHideTimer)
+  if (dropBadgeTimer) clearTimeout(dropBadgeTimer)
 })
 
 // One slot per running worker, kept while it waits between files so the list
@@ -263,6 +266,51 @@ const scanPercent = computed(() => {
   return scan?.Phase === 'checking' && scan.Total > 0 ? Math.round((scan.Checked / scan.Total) * 100) : null
 })
 
+// A quick scan would flash past unseen, so the scan line stays up for at
+// least a moment, ending on "Scan finished".
+const minScanDisplayMs = 1500
+const shownScanLabel = ref('')
+let scanShownAt = 0
+let scanHideTimer: ReturnType<typeof setTimeout> | null = null
+watch(scanLabel, (label) => {
+  if (scanHideTimer) {
+    clearTimeout(scanHideTimer)
+    scanHideTimer = null
+  }
+  if (label) {
+    if (!shownScanLabel.value) scanShownAt = Date.now()
+    shownScanLabel.value = label
+    return
+  }
+  if (!shownScanLabel.value) return
+  shownScanLabel.value = 'Scan finished'
+  scanHideTimer = setTimeout(() => {
+    shownScanLabel.value = ''
+    scanHideTimer = null
+  }, Math.max(800, minScanDisplayMs - (Date.now() - scanShownAt)))
+}, { immediate: true })
+
+// Files added to a run that is already going change the total, the bytes and
+// the percentage at once; say what was added, and mark it next to the numbers.
+const dropBadge = ref<{ added: number; bytes: number } | null>(null)
+let dropBadgeTimer: ReturnType<typeof setTimeout> | null = null
+watch(() => state.lastDrop, (drop) => {
+  if (!drop || !drop.midRun) return
+  const notes: string[] = []
+  if (drop.alreadyQueued) notes.push(`${drop.alreadyQueued.toLocaleString()} already in the queue`)
+  if (drop.skipped) notes.push(`${drop.skipped.toLocaleString()} skipped`)
+  if (drop.added) {
+    toast.success(`Added ${drop.added.toLocaleString()} file(s) to the queue`, {
+      description: [`${formatBytes(drop.bytes)} more to upload`, ...notes].join(' · '),
+    })
+    dropBadge.value = { added: drop.added, bytes: drop.bytes }
+    if (dropBadgeTimer) clearTimeout(dropBadgeTimer)
+    dropBadgeTimer = setTimeout(() => { dropBadge.value = null }, 6000)
+  } else {
+    toast.info('No new files added', { description: notes.join(' · ') || 'The drop had no files to upload.' })
+  }
+})
+
 // One row per kind of warning, with its files, instead of one row each.
 const warningGroups = computed(() => {
   const groups = new Map<string, { message: string; paths: string[] }>()
@@ -333,7 +381,10 @@ async function copyResults() {
         </SheetContent>
       </Sheet>
       <p class="text-2xl font-bold tabular-nums">
-        {{ runProcessed.toLocaleString() }}<span class="text-muted-foreground font-normal">/</span><span class="text-muted-foreground">{{ runTotal.toLocaleString() }}</span>
+        {{ runProcessed.toLocaleString() }}<span class="text-muted-foreground font-normal">/</span><span class="text-muted-foreground">{{ runTotal.toLocaleString() }}</span><span
+          v-if="dropBadge"
+          class="ml-1.5 align-middle text-sm font-semibold text-primary"
+        >+{{ dropBadge.added.toLocaleString() }}</span>
       </p>
       <p class="text-xs text-muted-foreground flex items-center justify-center gap-1.5">
         <WifiOff
@@ -348,11 +399,11 @@ async function copyResults() {
 
     <!-- Scan progress for drops still being read -->
     <div
-      v-if="scanLabel"
+      v-if="shownScanLabel"
       class="rounded-md border bg-muted/30 px-2.5 py-1.5"
     >
       <p class="text-xs text-muted-foreground tabular-nums">
-        {{ scanLabel }}
+        {{ shownScanLabel }}
       </p>
       <Progress
         v-if="scanPercent !== null"
@@ -387,7 +438,10 @@ async function copyResults() {
         class="h-2.5"
       />
       <div class="flex justify-between mt-1.5 text-xs text-muted-foreground">
-        <span v-if="bytesDisplay">{{ bytesDisplay }}</span>
+        <span v-if="bytesDisplay">{{ bytesDisplay }}<span
+          v-if="dropBadge && dropBadge.bytes"
+          class="ml-1 font-semibold text-primary"
+        >+{{ formatBytes(dropBadge.bytes) }}</span></span>
         <span v-else>&nbsp;</span>
         <span class="font-medium">{{ progressPercent }}%</span>
       </div>

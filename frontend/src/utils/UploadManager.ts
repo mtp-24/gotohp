@@ -106,6 +106,17 @@ export interface AlbumEntry {
   error: string;
 }
 
+// What one or more drops added, reported once their scan finishes.
+export interface DropSummary {
+  added: number;
+  bytes: number;
+  alreadyQueued: number;
+  skipped: number;
+  // Whether the drop joined a run that was already going.
+  midRun: boolean;
+  at: number;
+}
+
 export interface UploadState {
   isUploading: boolean;
   // Every item since the list was last cleared, in queue order. The array is
@@ -116,6 +127,8 @@ export interface UploadState {
   listVersion: number;
   // items.length as of the last listVersion.
   itemCount: number;
+  // The latest drop's summary, set when its scan finishes.
+  lastDrop: DropSummary | null;
   runId: number;
   queueStatus: QueueStatus;
   totalFiles: number;
@@ -146,6 +159,7 @@ class UploadManager {
     items: markRaw([]) as QueueItem[],
     listVersion: 0,
     itemCount: 0,
+    lastDrop: null,
     runId: 0,
     queueStatus: idleQueueStatus(),
     totalFiles: 0,
@@ -179,6 +193,8 @@ class UploadManager {
   private totalBytesAdjustment: number = 0;
   // Last value handed out as an item's seq.
   private seq = 0;
+  // Counts what the drops being scanned add; see queueStatus.
+  private drop: Omit<DropSummary, "at"> | null = null;
   // Throttles list refreshes; see refreshList.
   private listTimer: ReturnType<typeof setTimeout> | null = null;
   private lastListRefresh = 0;
@@ -235,6 +251,14 @@ class UploadManager {
         if (!this.itemIndex.has(item.ID)) {
           this.insertItem(item);
         }
+        if (this.drop) {
+          if (item.State === "skipped") {
+            this.drop.skipped++;
+          } else {
+            this.drop.added++;
+            this.drop.bytes += Math.max(0, item.Size);
+          }
+        }
       }
     });
 
@@ -260,8 +284,22 @@ class UploadManager {
       this.refreshList();
     });
 
+    // A scan starting and finishing brackets what a drop adds: count it
+    // between the two and publish a summary at the end.
     Events.On("queueStatus", (event: { data: QueueStatus }) => {
+      const wasScanning = !!this.state.queueStatus.Scan?.Phase;
+      const scanning = !!event.data.Scan?.Phase;
+      if (!wasScanning && scanning) {
+        this.drop = {
+          added: 0, bytes: 0, alreadyQueued: 0, skipped: 0,
+          midRun: this.state.isUploading && this.state.items.length > 0,
+        };
+      }
       this.state.queueStatus = event.data;
+      if (wasScanning && !scanning && this.drop) {
+        this.state.lastDrop = { ...this.drop, at: Date.now() };
+        this.drop = null;
+      }
     });
 
     // Handle async total bytes update (calculated after uploadStart)
@@ -276,6 +314,9 @@ class UploadManager {
 
     Events.On("uploadWarning", (event: { data: PreflightWarning }) => {
       this.state.warnings.push(event.data);
+      if (this.drop && event.data.Code === "already-queued") {
+        this.drop.alreadyQueued += event.data.Paths.length;
+      }
       if (!isSkippedUploadWarning(event.data.Code)) {
         this.state.results.warnings.push({
           paths: event.data.Paths,
