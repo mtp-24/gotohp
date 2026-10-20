@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, toRef } from 'vue'
 import type { ThreadStatus } from '../utils/UploadManager'
+import { useUploadSpeed } from '../utils/useUploadSpeed'
 import { Progress } from '@/components/ui/progress'
 
 const props = defineProps<{
@@ -55,6 +56,9 @@ const fileSizeDisplay = computed(() => {
   return `${formatBytes(props.thread.BytesUploaded)}/${formatBytes(props.thread.BytesTotal)}`
 })
 
+const speed = useUploadSpeed(toRef(props, 'thread'))
+const speedDisplay = computed(() => speed.value === null ? '' : `${formatBytes(Math.round(speed.value))}/s`)
+
 const statusMessage = computed(() => props.thread.Message.replace(/^Error:\s*/, ''))
 </script>
 
@@ -84,7 +88,7 @@ const statusMessage = computed(() => props.thread.Message.replace(/^Error:\s*/, 
         v-if="uploadPercent !== null"
         class="shrink-0 text-[10px] text-muted-foreground tabular-nums"
       >
-        {{ fileSizeDisplay }} · {{ uploadPercent }}%
+        {{ fileSizeDisplay }} · {{ uploadPercent }}%<template v-if="speedDisplay"> · <span class="text-foreground">{{ speedDisplay }}</span></template>
       </span>
     </div>
     <Progress

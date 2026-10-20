@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, ref, toRef, watch } from 'vue'
 import type { QueueItem, ThreadStatus } from '../utils/UploadManager'
+import { useUploadSpeed } from '../utils/useUploadSpeed'
 import { Film, Image as ImageIcon, RotateCcw, X } from '@lucide/vue'
 
 const props = defineProps<{
@@ -36,9 +37,24 @@ const uploadPercent = computed(() => {
   return Math.round((thread.BytesUploaded / thread.BytesTotal) * 100)
 })
 
+const speed = useUploadSpeed(toRef(props, 'thread'))
+
+function formatSpeed(bytesPerSecond: number): string {
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = bytesPerSecond
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit++
+  }
+  return `${parseFloat(value.toFixed(1))} ${units[unit]}/s`
+}
+
 const detail = computed(() => {
   if (props.item.State === 'active' && props.thread) {
-    return uploadPercent.value !== null ? `${props.thread.Message} ${uploadPercent.value}%` : props.thread.Message
+    if (uploadPercent.value === null) return props.thread.Message
+    const rate = speed.value === null ? '' : ` · ${formatSpeed(speed.value)}`
+    return `${props.thread.Message} ${uploadPercent.value}%${rate}`
   }
   return props.item.Message
 })
